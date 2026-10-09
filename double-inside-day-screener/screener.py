@@ -510,7 +510,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--email",
         action="store_true",
-        help="Email today's screen after 4:16 PM Eastern. Used by the weekday job.",
+        help="Send the combined after-close email at 4:16 PM Eastern. Used by the weekday job.",
     )
     return parser.parse_args()
 
@@ -793,60 +793,13 @@ def send_email(screen_date: str, body: str, password: str, note: str = "") -> No
 
 
 def send_scheduled_email() -> int:
-    now = datetime.datetime.now(EASTERN)
-    today = now.date().isoformat()
-    if now.weekday() >= 5 or (now.hour, now.minute) < SEND_AFTER or already_handled(today):
-        return 0
+    import importlib.util
 
-    password = load_env().get("GMAIL_APP_PASSWORD", "").replace(" ", "")
-    if not password:
-        warned = (
-            EMAIL_PASSWORD_WARNING.exists()
-            and EMAIL_PASSWORD_WARNING.read_text(encoding="utf-8").strip() == today
-        )
-        if not warned:
-            email_log("Gmail app password missing; not sending")
-            EMAIL_PASSWORD_WARNING.parent.mkdir(parents=True, exist_ok=True)
-            EMAIL_PASSWORD_WARNING.write_text(today + "\n", encoding="utf-8")
-        return 0
-
-    stdout = StringIO()
-    stderr = StringIO()
-    try:
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = run_screen(date.today())
-    except Exception as error:
-        email_log(f"Screener failed: {error}")
-        if (now.hour, now.minute) >= GIVE_UP:
-            mark_handled(today)
-        return 1
-    if code != 0:
-        email_log(f"Screener failed: {stderr.getvalue().strip()[-500:]}")
-        if (now.hour, now.minute) >= GIVE_UP:
-            mark_handled(today)
-        return 1
-
-    dates = re.findall(r"^(\d{4}-\d{2}-\d{2}): \d+ symbols", stderr.getvalue(), re.MULTILINE)
-    screen_date = dates[0] if dates else ""
-    if screen_date != today:
-        if (now.hour, now.minute) >= GIVE_UP:
-            mark_handled(today)
-            email_log(f"No trading session for {today}; not sending")
-        else:
-            email_log(f"Session for {today} is not ready yet")
-        return 0
-
-    body = stdout.getvalue().strip("\n")
-    if not body.strip():
-        body = "No stocks matched."
-    note = ""
-    for line in stderr.getvalue().splitlines():
-        if line.startswith("NEXT_DAY_PICK "):
-            note = line.removeprefix("NEXT_DAY_PICK ").strip()
-    send_email(screen_date, body, password, note)
-    mark_handled(today)
-    email_log(f"Sent {screen_date} screen to {EMAIL_TO}")
-    return 0
+    path = Path(__file__).resolve().parents[1] / "daily-email.py"
+    spec = importlib.util.spec_from_file_location("daily_email", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.send_scheduled_email()
 
 
 def main() -> int:
