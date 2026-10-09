@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+screen-last-15.csv
+screen-last-15.tsv
