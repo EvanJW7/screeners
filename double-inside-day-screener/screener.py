@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Screen for a 30% up day on 10M shares, followed by two inside days. Each inside day has a 2% buffer."""
+"""Screen for a 30% up day on 10M shares, followed by two inside days.
+
+The two inside days can start the session after the up day, or one session later.
+Each inside day has a 2% buffer. The up day's high must be at least 5% above its low.
+"""
 
 import argparse
 import datetime
@@ -25,6 +29,7 @@ from bs4 import BeautifulSoup
 MIN_RETURN = 0.30
 UP_DAY_VOLUME = 10_000_000
 INSIDE_BUFFER = 0.02
+MIN_UP_DAY_RANGE = 0.05
 DETAIL_WORKERS = 6
 KEY_FILE = Path.home() / ".config" / "two-day-screener" / "env"
 CONFIG = Path.home() / ".config" / "double-inside-day-screener"
@@ -232,7 +237,7 @@ def load_sessions(
         bars = parse_bars(rows)
         sessions.append((day, bars))
         log(f"{day.isoformat()}: {len(bars)} symbols")
-        if len(sessions) == 4:
+        if len(sessions) == 5:
             break
     return sessions
 
@@ -261,40 +266,64 @@ def is_inside(high: float, low: float, prior_high: float, prior_low: float) -> b
     return high <= prior_high * (1 + INSIDE_BUFFER) and low >= prior_low * (1 - INSIDE_BUFFER)
 
 
+def up_day_change(close: float, volume: float, base_close: float, high: float, low: float) -> float | None:
+    """Return the percent gain when the day is a 30% rise on at least 10M shares.
+
+    The high must be at least 5% above the low, so a gap that then trades in a
+    tight range does not qualify.
+    """
+    if base_close <= 0 or close <= 0 or low <= 0:
+        return None
+    change = (close - base_close) / base_close * 100
+    if change < MIN_RETURN * 100 or volume < UP_DAY_VOLUME:
+        return None
+    if (high - low) / low < MIN_UP_DAY_RANGE:
+        return None
+    return change
+
+
 def find_matches(
     universe: set[str],
     sessions: list[tuple[date, dict[str, tuple[float, float, float, float]]]],
     next_session: tuple[date, dict[str, tuple[float, float, float, float]]] | None = None,
 ) -> list[dict]:
-    if len(sessions) < 4:
-        raise RuntimeError("Need the day before the up day, the up day, and two inside days")
+    if len(sessions) < 5:
+        raise RuntimeError("Need the up day, the day before it, and two inside days")
     screen_day, screen = sessions[0]
     inside_day, first_inside = sessions[1]
-    up_day, spike = sessions[2]
-    _, base = sessions[3]
+    adjacent_day, adjacent = sessions[2]
+    earlier_day, earlier = sessions[3]
+    _, base = sessions[4]
     log(
-        f"Looking for a {MIN_RETURN * 100:.0f}% up day on {up_day.isoformat()} "
-        f"with at least {UP_DAY_VOLUME:,.0f} shares, then inside days on "
+        f"Looking for a {MIN_RETURN * 100:.0f}% up day with at least {UP_DAY_VOLUME:,.0f} shares "
+        f"on {adjacent_day.isoformat()}, or on {earlier_day.isoformat()} with "
+        f"{adjacent_day.isoformat()} in between. Inside days are "
         f"{inside_day.isoformat()} and {screen_day.isoformat()}"
     )
     matches: list[dict] = []
     for symbol, (price, volume, high, low) in screen.items():
         if symbol not in universe or price <= 0:
             continue
-        if symbol not in first_inside or symbol not in spike or symbol not in base:
+        if symbol not in first_inside or symbol not in adjacent or symbol not in earlier or symbol not in base:
             continue
         inside_close, _, inside_high, inside_low = first_inside[symbol]
-        up_close, up_volume, up_high, up_low = spike[symbol]
+        adjacent_close, adjacent_volume, adjacent_high, adjacent_low = adjacent[symbol]
+        earlier_close, earlier_volume, earlier_high, earlier_low = earlier[symbol]
         base_close = base[symbol][0]
-        if base_close <= 0 or up_close <= 0 or inside_close <= 0 or up_high <= 0 or inside_high <= 0:
-            continue
-        up_change = (up_close - base_close) / base_close * 100
-        if up_change < MIN_RETURN * 100 or up_volume < UP_DAY_VOLUME:
-            continue
-        if not is_inside(inside_high, inside_low, up_high, up_low):
+        if inside_close <= 0 or inside_high <= 0 or adjacent_high <= 0:
             continue
         if not is_inside(high, low, inside_high, inside_low):
             continue
+        # The inside days start the session after the up day.
+        change = up_day_change(adjacent_close, adjacent_volume, earlier_close, adjacent_high, adjacent_low)
+        up_volume = adjacent_volume
+        if change is None or not is_inside(inside_high, inside_low, adjacent_high, adjacent_low):
+            # Or one session later: the day after the up day is the pause, and the
+            # first inside day is inside that pause.
+            change = up_day_change(earlier_close, earlier_volume, base_close, earlier_high, earlier_low)
+            up_volume = earlier_volume
+            if change is None or not is_inside(inside_high, inside_low, adjacent_high, adjacent_low):
+                continue
         day_change = (price - inside_close) / inside_close * 100
         next_day_change = None
         if next_session is not None:
@@ -309,7 +338,7 @@ def find_matches(
                 "volume": volume,
                 "up_volume": up_volume,
                 "day_change": day_change,
-                "up_day_change": up_change,
+                "up_day_change": change,
                 "next_day_change": next_day_change,
                 "prior_high": inside_high,
             }
@@ -501,7 +530,7 @@ def print_elapsed(started: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Screen for a 30% up day on at least 10M shares, followed by two inside days. Each inside day has a 2% buffer."
+        description="Screen for a 30% up day on at least 10M shares, followed by two inside days. The up day's high must be at least 5% above its low."
     )
     parser.add_argument(
         "--date",
@@ -521,8 +550,8 @@ def run_screen(as_of: date) -> int:
     log("Loading US-listed symbols...")
     universe = load_symbols()
     sessions = load_sessions(api_key, as_of)
-    if len(sessions) < 4:
-        raise RuntimeError("Need the day before the up day, the up day, and two inside days")
+    if len(sessions) < 5:
+        raise RuntimeError("Need the up day, the day before it, and two inside days")
     screen_day = sessions[0][0]
     if screen_day < datetime.date.today():
         listed_then = load_listed_on(api_key, screen_day)
