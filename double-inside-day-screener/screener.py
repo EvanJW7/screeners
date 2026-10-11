@@ -12,6 +12,7 @@ import re
 import smtplib
 import sys
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, timedelta
@@ -69,6 +70,24 @@ COLUMNS = [
     "Finviz Shares Float",
     "Finviz Short % of Float",
 ]
+RESULTS_PATH = Path(__file__).resolve().parent / "double-inside-day-screener-results.xlsx"
+RESULTS_COLUMNS = [
+    "Date",
+    "Symbol",
+    "Price",
+    "% Change",
+    "Next Day %",
+    "Max Next Day",
+    "Up Day %",
+    "Volume",
+    "Up Volume",
+    "Avg Volume",
+    "Country",
+    "Finviz Market Cap",
+    "Finviz Shares Float",
+    "Finviz Short % of Float",
+]
+BLANK_CELL = {"", "—", "-", "–"}
 
 
 def log(message: str) -> None:
@@ -326,10 +345,15 @@ def find_matches(
                 continue
         day_change = (price - inside_close) / inside_close * 100
         next_day_change = None
-        if next_session is not None:
-            next_close = next_session[1].get(symbol, (None,))[0]
-            if next_close is not None:
-                next_day_change = (next_close - price) / price * 100
+        next_day_max = None
+        if next_session is not None and price > 0:
+            next_bar = next_session[1].get(symbol)
+            if next_bar is not None:
+                next_close, _, next_high, _ = next_bar
+                if next_close is not None:
+                    next_day_change = (next_close - price) / price * 100
+                if next_high is not None:
+                    next_day_max = (next_high - price) / price * 100
         matches.append(
             {
                 "date": screen_day.isoformat(),
@@ -340,6 +364,7 @@ def find_matches(
                 "day_change": day_change,
                 "up_day_change": change,
                 "next_day_change": next_day_change,
+                "next_day_max": next_day_max,
                 "prior_high": inside_high,
             }
         )
@@ -438,6 +463,7 @@ def fetch_row(match: dict) -> dict:
         "Volume": fmt_volume(match["volume"]),
         "% Change": fmt_day_change(match["day_change"]),
         "Next Day %": fmt_day_change(match.get("next_day_change")),
+        "Max Next Day": fmt_day_change(match.get("next_day_max")),
         "Up Day %": fmt_day_change(match["up_day_change"]),
         "Up Volume": fmt_volume(match["up_volume"]),
         "Avg Volume": fmt_volume(match.get("average_volume")),
@@ -454,6 +480,7 @@ def table_columns(include_next_day: bool) -> list[str]:
     columns = list(COLUMNS)
     if include_next_day:
         columns.insert(columns.index("% Change") + 1, "Next Day %")
+        columns.insert(columns.index("Next Day %") + 1, "Max Next Day")
     return columns
 
 
@@ -534,7 +561,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--date",
-        help="Run the screen as of this date (YYYY-MM-DD). A past date adds the next day's percent change.",
+        help="Run the screen as of this date (YYYY-MM-DD). A past date adds the next day's close and high versus this close.",
     )
     parser.add_argument(
         "--email",
@@ -596,6 +623,7 @@ def run_screen(as_of: date) -> int:
         rows.sort(key=lambda row: sort_percent(row["Up Day %"]), reverse=True)
     print_table(rows, columns)
     print_elapsed(started)
+    save_screen_results(rows)
     pick = next_day_pick(rows)
     if pick:
         log(f"NEXT_DAY_PICK {pick}")
@@ -675,7 +703,7 @@ def column_letter(index: int) -> str:
     return letters
 
 
-def spreadsheet_bytes(columns: list[str], rows: list[list[str]]) -> bytes:
+def spreadsheet_bytes(columns: list[str], rows: list[list[str]], protect: bool = True) -> bytes:
     """Excel file with centered cells and a locked header row."""
     xml_rows: list[str] = []
     sheet_rows = [columns, *rows]
@@ -703,8 +731,12 @@ def spreadsheet_bytes(columns: list[str], rows: list[list[str]]) -> bytes:
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         f"<cols>{''.join(widths)}</cols>"
         f"<sheetData>{''.join(xml_rows)}</sheetData>"
-        '<sheetProtection sheet="1" objects="1" scenarios="1" selectLockedCells="1" selectUnlockedCells="1"/>'
-        f'<autoFilter ref="A1:{last_column}{max(len(sheet_rows), 1)}"/>'
+        + (
+            '<sheetProtection sheet="1" objects="1" scenarios="1" selectLockedCells="1" selectUnlockedCells="1"/>'
+            if protect
+            else ""
+        )
+        + f'<autoFilter ref="A1:{last_column}{max(len(sheet_rows), 1)}"/>'
         "</worksheet>"
     )
     styles = (
@@ -763,6 +795,108 @@ def spreadsheet_bytes(columns: list[str], rows: list[list[str]]) -> bytes:
         workbook_zip.writestr("xl/styles.xml", styles)
         workbook_zip.writestr("xl/worksheets/sheet1.xml", sheet)
     return buffer.getvalue()
+
+
+def column_index(letters: str) -> int:
+    index = 0
+    for char in letters:
+        index = index * 26 + ord(char.upper()) - 64
+    return index - 1
+
+
+def read_result_rows(path: Path) -> list[list[str]]:
+    """Read stored rows, aligned to RESULTS_COLUMNS. Missing columns stay blank."""
+    namespace = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with ZipFile(path) as workbook:
+        sheet = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in workbook.namelist():
+            strings = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
+            for item in strings.findall("m:si", namespace):
+                shared.append("".join(node.text or "" for node in item.findall(".//m:t", namespace)))
+    parsed: list[list[str]] = []
+    for row in sheet.findall("m:sheetData/m:row", namespace):
+        cells: dict[int, str] = {}
+        for cell in row.findall("m:c", namespace):
+            ref = cell.get("r") or ""
+            letters = "".join(char for char in ref if char.isalpha())
+            if not letters:
+                continue
+            kind = cell.get("t")
+            if kind == "inlineStr":
+                value = "".join(node.text or "" for node in cell.findall(".//m:t", namespace))
+            elif kind == "s":
+                node = cell.find("m:v", namespace)
+                value = shared[int(node.text)] if node is not None and node.text else ""
+            else:
+                node = cell.find("m:v", namespace)
+                value = node.text if node is not None and node.text else ""
+            cells[column_index(letters)] = value
+        if not cells:
+            continue
+        width = max(cells) + 1
+        parsed.append([cells.get(index, "") for index in range(width)])
+    if not parsed:
+        return []
+    headers = parsed[0]
+    if "Date" not in headers or "Symbol" not in headers:
+        raise ValueError(f"{path.name} is missing Date or Symbol columns")
+    stored: list[list[str]] = []
+    for row in parsed[1:]:
+        by_name = {headers[index]: value for index, value in enumerate(row) if index < len(headers)}
+        if not by_name.get("Date") or not by_name.get("Symbol"):
+            continue
+        stored.append([by_name.get(column, "—") or "—" for column in RESULTS_COLUMNS])
+    return stored
+
+
+def result_key(row: list[str]) -> tuple[str, str]:
+    return row[0], row[1].upper()
+
+
+def save_screen_results(rows: list[dict], path: Path = RESULTS_PATH) -> None:
+    """Add this run to the results spreadsheet. The same date and symbol is kept once."""
+    try:
+        stored = read_result_rows(path) if path.exists() else []
+    except (OSError, ValueError, ET.ParseError, KeyError) as error:
+        log(f"Could not read {path.name}: {error}")
+        return
+    existing = {result_key(row): index for index, row in enumerate(stored)}
+    added = 0
+    updated = 0
+    for row in rows:
+        cells = [str(row.get(column, "—") or "—") for column in RESULTS_COLUMNS]
+        key = result_key(cells)
+        index = existing.get(key)
+        if index is None:
+            existing[key] = len(stored)
+            stored.append(cells)
+            added += 1
+            continue
+        current = stored[index]
+        for column in ("Next Day %", "Max Next Day"):
+            position = RESULTS_COLUMNS.index(column)
+            if current[position] in BLANK_CELL and cells[position] not in BLANK_CELL:
+                current[position] = cells[position]
+                updated += 1
+    if added == 0 and updated == 0:
+        log(f"No new rows. {len(rows)} already in {path}")
+        return
+    stored.sort(key=result_key)
+    temporary = path.with_suffix(".xlsx.tmp")
+    try:
+        temporary.write_bytes(spreadsheet_bytes(RESULTS_COLUMNS, stored, protect=False))
+        temporary.replace(path)
+    except OSError as error:
+        log(f"Could not update {path.name}: {error}")
+        return
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    if added:
+        log(f"Saved {added} new row(s) to {path} ({len(stored)} total)")
+    if updated:
+        log(f"Filled in next-day results for {updated} cell(s) already in {path}")
 
 
 def html_table(columns: list[str], rows: list[list[str]], elapsed: str, note: str = "") -> str:

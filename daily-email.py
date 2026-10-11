@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send the inside-day, double inside-day, and 9 SMA screens in one email."""
+"""Send the inside-day, double inside-day, 9 SMA, large-cap inside-day, and top options-volume screens in one email."""
 
 import datetime
 import fcntl
@@ -25,13 +25,11 @@ EMAIL_TO = "evan.wright16@gmail.com"
 SEND_AFTER = (16, 16)
 GIVE_UP = (18, 0)
 SCREENS = (
-    ("Inside day", ROOT / "inside-day-screener" / "screener.py", "stock-screen-{date}.xlsx"),
-    (
-        "Double inside day",
-        ROOT / "double-inside-day-screener" / "screener.py",
-        "double-inside-day-screen-{date}.xlsx",
-    ),
-    ("9 SMA bounce", ROOT / "9sma-screener" / "screener.py", "nine-sma-bounce-{date}.xlsx"),
+    ("Inside day", ROOT / "inside-day-screener" / "screener.py"),
+    ("Double inside day", ROOT / "double-inside-day-screener" / "screener.py"),
+    ("9 SMA bounce", ROOT / "9sma-screener" / "screener.py"),
+    ("Large cap inside day", ROOT / "large-cap-inside-screener" / "screener.py"),
+    ("Top 10 options volume", ROOT / "options-volume-screener" / "screener.py"),
 )
 
 
@@ -84,24 +82,17 @@ def run_screen(module, today: datetime.date) -> dict:
     for line in stderr.getvalue().splitlines():
         if line.startswith("Completed in") and "Completed in" not in body:
             body = f"{body}\n\n{line}" if body else line
-    note = ""
-    for line in stderr.getvalue().splitlines():
-        if line.startswith("NEXT_DAY_PICK "):
-            note = line.removeprefix("NEXT_DAY_PICK ").strip()
     if not body.strip():
         body = "No stocks matched."
-    return {"screen_date": dates[0] if dates else "", "body": body, "note": note}
+    return {"screen_date": dates[0] if dates else "", "body": body}
 
 
-def section_html(module, title: str, body: str, note: str) -> str:
+def section_html(module, title: str, body: str) -> str:
     columns, rows, elapsed = module.parse_table(body)
     heading = f'<h2 style="font-family:Arial,sans-serif;font-size:18px;">{escape(title)}</h2>'
     if not columns:
-        text = f'<p style="font-family:Arial,sans-serif;">{escape(body)}</p>'
-        if note:
-            text += f'<p style="font-family:Arial,sans-serif;">{escape(note)}</p>'
-        return heading + text
-    return heading + module.html_table(columns, rows, elapsed, note)
+        return heading + f'<p style="font-family:Arial,sans-serif;">{escape(body)}</p>'
+    return heading + module.html_table(columns, rows, elapsed)
 
 
 def send_email(screen_date: str, sections: list[dict], problems: list[str], password: str, module) -> None:
@@ -110,18 +101,11 @@ def send_email(screen_date: str, sections: list[dict], problems: list[str], pass
         "<div>",
         f'<p style="font-family:Arial,sans-serif;">Stock screens for {escape(screen_date)}</p>',
     ]
-    attachments = []
     for section in sections:
         text_parts.append(section["title"])
         text_parts.append(section["body"])
-        if section["note"]:
-            text_parts.append("")
-            text_parts.append(section["note"])
         text_parts.append("")
-        html_parts.append(section_html(module, section["title"], section["body"], section["note"]))
-        columns, rows, _elapsed = module.parse_table(section["body"])
-        if columns:
-            attachments.append((module.spreadsheet_bytes(columns, rows), section["filename"]))
+        html_parts.append(section_html(module, section["title"], section["body"]))
     for problem in problems:
         text_parts.append(problem)
         html_parts.append(f'<p style="font-family:Arial,sans-serif;">{escape(problem)}</p>')
@@ -131,13 +115,6 @@ def send_email(screen_date: str, sections: list[dict], problems: list[str], pass
     message["Subject"] = f"Stock screens {screen_date}"
     message.set_content("\n".join(text_parts).strip() + "\n")
     message.add_alternative("".join(html_parts) + "</div>", subtype="html")
-    for payload, filename in attachments:
-        message.add_attachment(
-            payload,
-            maintype="application",
-            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=filename,
-        )
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
         smtp.ehlo()
         smtp.starttls()
@@ -160,7 +137,7 @@ def send_scheduled_email() -> int:
             return 0
         modules = [
             load_module(path, f"screen_{index}")
-            for index, (_title, path, _filename) in enumerate(SCREENS)
+            for index, (_title, path) in enumerate(SCREENS)
         ]
         helper = modules[0]
         password = helper.load_env().get("GMAIL_APP_PASSWORD", "").replace(" ", "")
@@ -176,7 +153,7 @@ def send_scheduled_email() -> int:
 
         sections = []
         pending = []
-        for (title, _path, filename), module in zip(SCREENS, modules):
+        for (title, _path), module in zip(SCREENS, modules):
             try:
                 result = run_screen(module, now.date())
             except Exception as error:
@@ -189,8 +166,6 @@ def send_scheduled_email() -> int:
             sections.append({
                 "title": title,
                 "body": result["body"],
-                "note": result["note"],
-                "filename": filename.format(date=today),
             })
 
         if pending and (now.hour, now.minute) < GIVE_UP:
