@@ -7,6 +7,7 @@ import importlib.util
 import re
 import smtplib
 import sys
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from email.message import EmailMessage
 from html import escape
@@ -21,7 +22,6 @@ EMAIL_LOG = CONFIG / "email.log"
 EMAIL_PASSWORD_WARNING = CONFIG / "last-password-warning"
 LOCK_FILE = CONFIG / "run.lock"
 EASTERN = ZoneInfo("America/New_York")
-EMAIL_TO = "evan.wright16@gmail.com"
 SEND_AFTER = (16, 16)
 GIVE_UP = (18, 0)
 SCREENS = (
@@ -78,10 +78,12 @@ def run_screen(module, today: datetime.date) -> dict:
         detail = stderr.getvalue().strip()[-500:]
         raise RuntimeError(detail or f"{module.__name__} exited {code}")
     dates = re.findall(r"^(\d{4}-\d{2}-\d{2}): \d+ symbols", stderr.getvalue(), re.MULTILINE)
-    body = stdout.getvalue().strip("\n")
-    for line in stderr.getvalue().splitlines():
-        if line.startswith("Completed in") and "Completed in" not in body:
-            body = f"{body}\n\n{line}" if body else line
+    lines = [
+        line
+        for line in stdout.getvalue().splitlines()
+        if not line.startswith("Completed in")
+    ]
+    body = "\n".join(lines).strip("\n")
     if not body.strip():
         body = "No stocks matched."
     return {"screen_date": dates[0] if dates else "", "body": body}
@@ -95,7 +97,15 @@ def section_html(module, title: str, body: str) -> str:
     return heading + module.html_table(columns, rows, elapsed)
 
 
-def send_email(screen_date: str, sections: list[dict], problems: list[str], password: str, module) -> None:
+def send_email(
+    screen_date: str,
+    sections: list[dict],
+    problems: list[str],
+    password: str,
+    recipient: str,
+    module,
+    started: float,
+) -> None:
     text_parts = [f"Stock screens for {screen_date}", ""]
     html_parts = [
         "<div>",
@@ -109,17 +119,20 @@ def send_email(screen_date: str, sections: list[dict], problems: list[str], pass
     for problem in problems:
         text_parts.append(problem)
         html_parts.append(f'<p style="font-family:Arial,sans-serif;">{escape(problem)}</p>')
-    message = EmailMessage()
-    message["From"] = EMAIL_TO
-    message["To"] = EMAIL_TO
-    message["Subject"] = f"Stock screens {screen_date}"
-    message.set_content("\n".join(text_parts).strip() + "\n")
-    message.add_alternative("".join(html_parts) + "</div>", subtype="html")
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
         smtp.ehlo()
         smtp.starttls()
         smtp.ehlo()
-        smtp.login(EMAIL_TO, password)
+        smtp.login(recipient, password)
+        summary = f"Completed in {time.perf_counter() - started:.2f} seconds"
+        text_parts.append(summary)
+        html_parts.append(f'<p style="font-family:Arial,sans-serif;">{escape(summary)}</p>')
+        message = EmailMessage()
+        message["From"] = recipient
+        message["To"] = recipient
+        message["Subject"] = f"Daily Report {screen_date}"
+        message.set_content("\n".join(text_parts).strip() + "\n")
+        message.add_alternative("".join(html_parts) + "</div>", subtype="html")
         smtp.send_message(message)
 
 
@@ -135,19 +148,22 @@ def send_scheduled_email() -> int:
         today = now.date().isoformat()
         if already_handled(today):
             return 0
+        started = time.perf_counter()
         modules = [
             load_module(path, f"screen_{index}")
             for index, (_title, path) in enumerate(SCREENS)
         ]
         helper = modules[0]
-        password = helper.load_env().get("GMAIL_APP_PASSWORD", "").replace(" ", "")
-        if not password:
+        env = helper.load_env()
+        password = env.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+        recipient = env.get("EMAIL_TO", "").strip()
+        if not password or not recipient:
             warned = (
                 EMAIL_PASSWORD_WARNING.exists()
                 and EMAIL_PASSWORD_WARNING.read_text(encoding="utf-8").strip() == today
             )
             if not warned:
-                email_log("Gmail app password missing; not sending")
+                email_log("Gmail app password or EMAIL_TO missing; not sending")
                 EMAIL_PASSWORD_WARNING.write_text(today + "\n", encoding="utf-8")
             return 0
 
@@ -175,10 +191,10 @@ def send_scheduled_email() -> int:
             mark_handled(today, modules)
             email_log(f"No screens ready for {today}; not sending")
             return 0
-        send_email(today, sections, pending, password, helper)
+        send_email(today, sections, pending, password, recipient, helper, started)
         mark_handled(today, modules)
         names = ", ".join(section["title"] for section in sections)
-        email_log(f"Sent {today} combined screen ({names}) to {EMAIL_TO}")
+        email_log(f"Sent {today} combined screen ({names})")
         return 0
     except Exception as error:
         email_log(f"Email run failed: {error}")

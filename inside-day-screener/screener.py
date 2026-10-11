@@ -38,7 +38,6 @@ EMAIL_STAMP = KEY_FILE.parent / "last-email-date"
 EMAIL_PASSWORD_WARNING = KEY_FILE.parent / "last-password-warning"
 EMAIL_LOG = KEY_FILE.parent / "email.log"
 EASTERN = ZoneInfo("America/New_York")
-EMAIL_TO = "evan.wright16@gmail.com"
 SEND_AFTER = (16, 16)
 GIVE_UP = (18, 0)
 GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{day}"
@@ -996,12 +995,15 @@ def html_table(columns: list[str], rows: list[list[str]], elapsed: str, note: st
 
 
 def send_email(screen_date: str, body: str, password: str, note: str = "") -> None:
+    recipient = load_env().get("EMAIL_TO", "").strip()
+    if not recipient:
+        raise RuntimeError("EMAIL_TO is not set")
     columns, rows, elapsed = parse_table(body)
     if note:
         body = f"{body}\n\n{note}"
     message = EmailMessage()
-    message["From"] = EMAIL_TO
-    message["To"] = EMAIL_TO
+    message["From"] = recipient
+    message["To"] = recipient
     message["Subject"] = f"Stock screen {screen_date}"
     message.set_content(body)
     if columns:
@@ -1016,7 +1018,7 @@ def send_email(screen_date: str, body: str, password: str, note: str = "") -> No
         smtp.ehlo()
         smtp.starttls()
         smtp.ehlo()
-        smtp.login(EMAIL_TO, password)
+        smtp.login(recipient, password)
         smtp.send_message(message)
 
 

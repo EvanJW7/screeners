@@ -52,7 +52,6 @@ EMAIL_LOG = CONFIG / "email.log"
 AVERAGE_CACHE = CONFIG / "volume-averages.json"
 LOCK_FILE = CONFIG / "run.lock"
 EASTERN = ZoneInfo("America/New_York")
-EMAIL_TO = "evan.wright16@gmail.com"
 MARKET_OPEN = (9, 30)
 MARKET_CLOSE = (16, 5)
 GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{day}"
@@ -521,11 +520,14 @@ def html_table(rows: list[dict]) -> str:
 
 
 def send_email(when: datetime.datetime, rows: list[dict], password: str) -> None:
+    recipient = load_env().get("EMAIL_TO", "").strip()
+    if not recipient:
+        raise RuntimeError("EMAIL_TO is not set")
     names = ", ".join(row["symbol"] for row in rows)
     subject_names = names if len(rows) <= 3 else f"{len(rows)} names"
     message = EmailMessage()
-    message["From"] = EMAIL_TO
-    message["To"] = EMAIL_TO
+    message["From"] = recipient
+    message["To"] = recipient
     message["Subject"] = f"Bull flag {subject_names} {clock(when.hour * 60 + when.minute)}"
     text = [f"Bull flag lookalikes at {when.strftime('%-I:%M %p')} Eastern.", ""]
     for row in table_rows(rows):
@@ -541,7 +543,7 @@ def send_email(when: datetime.datetime, rows: list[dict], password: str) -> None
         smtp.ehlo()
         smtp.starttls()
         smtp.ehlo()
-        smtp.login(EMAIL_TO, password)
+        smtp.login(recipient, password)
         smtp.send_message(message)
 
 
@@ -574,9 +576,11 @@ def run(now: datetime.datetime, email: bool) -> int:
             if not fresh:
                 log(f"No new bull flags. {len(rows)} already seen. Completed in {time.perf_counter() - started:.1f}s")
                 return 0
-            password = load_env().get("GMAIL_APP_PASSWORD", "").replace(" ", "")
-            if not password:
-                email_log("Gmail app password missing; not sending")
+            env = load_env()
+            password = env.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+            recipient = env.get("EMAIL_TO", "").strip()
+            if not password or not recipient:
+                email_log("Gmail app password or EMAIL_TO missing; not sending")
                 print_table(fresh)
                 return 0
             send_email(now, fresh, password)
