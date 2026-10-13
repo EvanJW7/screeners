@@ -59,16 +59,37 @@ def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def read_listing_file(url: str, cache_name: str) -> str:
+    """Live Nasdaq file, or the last good copy when the download is blocked."""
+    cache = KEY_FILE.parent / cache_name
+    text = ""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        text = response.text
+    except requests.RequestException:
+        text = ""
+    if "Security Name|" in text and not text.lstrip().startswith("<"):
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(text, encoding="utf-8")
+        return text
+    if cache.exists():
+        log(f"Using saved {cache_name}; the live Nasdaq file was unavailable")
+        return cache.read_text(encoding="utf-8")
+    raise RuntimeError(f"Nasdaq symbol file {cache_name} was unavailable")
+
+
 def load_listings() -> dict[str, tuple[str, str]]:
     """Symbol to (ETF flag, security name) from the Nasdaq trader files."""
     listings: dict[str, tuple[str, str]] = {}
-    sources = [(NASDAQ_LISTED, "Symbol"), (OTHER_LISTED, "ACT Symbol")]
-    for url, symbol_column in sources:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        response.raise_for_status()
+    sources = [
+        (NASDAQ_LISTED, "nasdaqlisted.txt", "Symbol"),
+        (OTHER_LISTED, "otherlisted.txt", "ACT Symbol"),
+    ]
+    for url, cache_name, symbol_column in sources:
         lines = [
             line
-            for line in response.text.splitlines()
+            for line in read_listing_file(url, cache_name).splitlines()
             if line and not line.startswith("File Creation Time")
         ]
         header = lines[0].split("|")

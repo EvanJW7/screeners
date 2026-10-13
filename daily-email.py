@@ -28,8 +28,6 @@ SCREENS = (
     ("Inside days", ROOT / "inside-day-screener" / "screener.py"),
     ("Double inside days", ROOT / "double-inside-day-screener" / "screener.py"),
     ("9 SMA bounce candidates", ROOT / "9sma-screener" / "screener.py"),
-    ("Large cap tightness", ROOT / "large-cap-inside-screener" / "screener.py"),
-    ("Top 10 options volume", ROOT / "options-volume-screener" / "screener.py"),
 )
 
 
@@ -216,7 +214,6 @@ def section_card(module, title: str, body: str) -> str:
     )
 
 
-OPTIONS_TITLES = {"Large cap tightness", "Top 10 options volume"}
 GAINERS = ROOT / "ytd-gainers" / "gainers.py"
 
 
@@ -306,25 +303,16 @@ def index_gainers(screen_day: datetime.date) -> tuple[str, str, list[str]]:
     return heading + gainer_pair(html_parts), "\n\n".join(text_parts), []
 
 
-def split_report(sections: list[dict], problems: list[str]) -> tuple[list[dict], list[str], list[dict], list[str], list[str]]:
-    stock_sections = []
-    options_sections = []
-    for section in sections:
-        if section["title"] in OPTIONS_TITLES:
-            options_sections.append(section)
-        else:
-            stock_sections.append(section)
+def split_report(sections: list[dict], problems: list[str]) -> tuple[list[dict], list[str], list[str]]:
     stock_problems = []
-    options_problems = []
     other_problems = []
+    screen_titles = tuple(title for title, _path in SCREENS)
     for problem in problems:
-        if problem.startswith(tuple(OPTIONS_TITLES)):
-            options_problems.append(problem)
-        elif any(problem.startswith(title) for title, _path in SCREENS if title not in OPTIONS_TITLES):
+        if screen_titles and problem.startswith(screen_titles):
             stock_problems.append(problem)
         else:
             other_problems.append(problem)
-    return stock_sections, stock_problems, options_sections, options_problems, other_problems
+    return sections, stock_problems, other_problems
 
 
 def part_html(module, title: str, sections: list[dict], problems: list[str], first: bool) -> str:
@@ -346,12 +334,12 @@ def report_html(
     module,
     gainer_html: str = "",
     gainer_problems: list[str] | None = None,
+    heading: str = "Daily Report",
+    eyebrow: str = "EQUITY SCREENS · US LISTED · CLOSE",
+    part_title: str = "Stock plays",
 ) -> str:
-    stock_sections, stock_problems, options_sections, options_problems, other_problems = split_report(
-        sections, problems
-    )
-    cards = part_html(module, "Stock plays", stock_sections, stock_problems, True)
-    cards += part_html(module, "Options plays", options_sections, options_problems, not cards)
+    stock_sections, stock_problems, other_problems = split_report(sections, problems)
+    cards = part_html(module, part_title, stock_sections, stock_problems, True)
     cards += "".join(warning_html(problem) for problem in other_problems)
     cards += gainer_html
     cards += "".join(warning_html(problem) for problem in (gainer_problems or []))
@@ -368,8 +356,8 @@ def report_html(
 <tr><td align="center" style="padding:28px 12px 36px;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:1200px;">
 <tr><td style="padding:0 6px 22px;border-bottom:1px solid {LINE};">
-<div style="color:{AMBER};font-family:{MONO};font-size:11px;letter-spacing:0.16em;">EQUITY SCREENS · US LISTED · CLOSE</div>
-<div style="margin-top:8px;color:{INK};font-family:{SANS};font-size:32px;font-weight:680;letter-spacing:-0.03em;">Daily Report</div>
+<div style="color:{AMBER};font-family:{MONO};font-size:11px;letter-spacing:0.16em;">{escape(eyebrow)}</div>
+<div style="margin-top:8px;color:{INK};font-family:{SANS};font-size:32px;font-weight:680;letter-spacing:-0.03em;">{escape(heading)}</div>
 <div style="margin-top:4px;color:{MUTED};font-family:{MONO};font-size:13px;">{when}</div>
 </td></tr>
 <tr><td style="padding-top:22px;">{cards}
@@ -392,22 +380,15 @@ def send_email(
     started: float,
 ) -> None:
     text_parts = [f"Daily Report {screen_date}", ""]
-    stock_sections, stock_problems, options_sections, options_problems, other_problems = split_report(
-        sections, problems
-    )
-    for heading, grouped, notes in (
-        ("Stock plays", stock_sections, stock_problems),
-        ("Options plays", options_sections, options_problems),
-    ):
-        if not grouped and not notes:
-            continue
-        text_parts.append(heading)
+    stock_sections, stock_problems, other_problems = split_report(sections, problems)
+    if stock_sections or stock_problems:
+        text_parts.append("Stock plays")
         text_parts.append("")
-        for section in grouped:
+        for section in stock_sections:
             text_parts.append(section["title"])
             text_parts.append(section["body"])
             text_parts.append("")
-        text_parts.extend(notes)
+        text_parts.extend(stock_problems)
     text_parts.extend(other_problems)
     try:
         gainer_html, gainer_text_body, gainer_problems = index_gainers(
