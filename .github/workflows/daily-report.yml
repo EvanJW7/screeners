@@ -1,0 +1,51 @@
+name: Daily report
+
+on:
+  schedule:
+    # GitHub schedules in UTC. These cover 3:16–5:00 PM Central in both
+    # daylight and standard time. The mailer sends once, after 3:16 PM Central.
+    - cron: "16,31,46 20 * * 1-5"
+    - cron: "1,16,31,46 21 * * 1-5"
+    - cron: "1,16,31,46 22 * * 1-5"
+    - cron: "1 23 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Restore the send stamp
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.config/screeners-email
+          key: daily-report-stamp-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: daily-report-stamp-
+
+      - name: Send the daily report
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python3 daily-email.py
+
+      - name: Save the send stamp
+        if: always()
+        run: mkdir -p ~/.config/screeners-email
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.config/screeners-email
+          key: daily-report-stamp-${{ github.run_id }}-${{ github.run_attempt }}

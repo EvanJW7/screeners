@@ -703,13 +703,16 @@ def email_log(message: str) -> None:
 
 def load_env() -> dict[str, str]:
     values: dict[str, str] = {}
-    if not KEY_FILE.exists():
-        return values
-    for line in KEY_FILE.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
+    if KEY_FILE.exists():
+        for line in KEY_FILE.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    for key in ("POLYGON_API_KEY", "GMAIL_APP_PASSWORD", "EMAIL_TO"):
+        override = os.environ.get(key, "").strip()
+        if override:
+            values[key] = override
     return values
 
 
