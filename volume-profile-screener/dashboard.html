@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Main Dashboard</title>
+  <style>
+    :root {
+      --bg: #0c0f12;
+      --panel: #141a20;
+      --line: #24303a;
+      --text: #e8eef2;
+      --muted: #8b98a5;
+      --up: #00b85c;
+      --down: #e23b3b;
+      --cyan: #4cc3ff;
+      --gold: #f5c16c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 16px 24px;
+      background: #10161c;
+      border-bottom: 1px solid var(--line);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0.02em;
+      font-weight: 700;
+    }
+    .badge {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 4px 8px;
+      border-radius: 3px;
+    }
+    .badge.live { color: #04140a; background: var(--up); }
+    .badge.closed { color: #1a1208; background: var(--gold); }
+    .clock { margin-left: auto; color: #ffffff; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }
+    main { padding: 20px 24px 32px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    th {
+      text-align: right;
+      padding: 10px 14px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--line);
+      background: #10161c;
+    }
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #1c262e;
+      font-variant-numeric: tabular-nums;
+      font-size: 15px;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    table.blotter th:nth-child(8), table.blotter td:nth-child(8) { text-align: left; }
+    tr.down td.symbol { border-left: 3px solid var(--down); }
+    tr.up td.symbol { border-left: 3px solid var(--up); }
+    tr.fresh td { background: #2c2618; }
+    .symbol { font-weight: 700; letter-spacing: 0.04em; }
+    .new {
+      color: #1a1208;
+      background: var(--gold);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-left: 8px;
+      padding: 1px 5px;
+      border-radius: 2px;
+      vertical-align: 1px;
+    }
+    .num { text-align: right; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .cyan { color: var(--cyan); }
+    .zone {
+      display: inline-block;
+      color: var(--cyan);
+      background: #102734;
+      border: 1px solid #1d4d66;
+      border-radius: 3px;
+      padding: 2px 8px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 13px;
+    }
+    .empty { color: var(--muted); text-align: left; }
+    h2 {
+      margin: 28px 0 10px;
+      font-size: 13px;
+      letter-spacing: 0.12em;
+      font-weight: 700;
+    }
+    h2 span { color: var(--cyan); margin-left: 8px; font-variant-numeric: tabular-nums; }
+    main h2:first-of-type { margin-top: 0; }
+    .note { color: var(--muted); font-size: 12px; margin: 14px 2px 0; max-width: 860px; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Main Dashboard</h1>
+    <span class="badge live">SESSION OPEN</span>
+    <span class="clock">Last refresh: 2:00 PM CT</span>
+  </header>
+  <main>
+    <h2>INSIDE DAY <span>5</span></h2>
+    <table>
+      <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th></tr></thead>
+      <tbody>
+        <tr><td class="symbol">FLYE</td><td class="num">3.59</td><td class="num up">+1.13%</td><td class="num">5,010,623</td><td class="num">1.56M</td><td class="num">2.82%</td></tr>
+<tr><td class="symbol">SKYA</td><td class="num">2.52</td><td class="num down">-3.64%</td><td class="num">1,323,874</td><td class="num">25.40M</td><td class="num">2.13%</td></tr>
+<tr><td class="symbol">AIXI</td><td class="num">2.87</td><td class="num down">-4.55%</td><td class="num">1,130,142</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="symbol">JBDI</td><td class="num">2.49</td><td class="num down">-27.33%</td><td class="num">2,758,366</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="symbol">TCRT</td><td class="num">2.06</td><td class="num down">-31.85%</td><td class="num">65,389,489</td><td class="num">2.43M</td><td class="num">0.40%</td></tr>
+      </tbody>
+    </table>
+<h2>DOUBLE INSIDE DAY <span>2</span></h2>
+    <table>
+      <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th></tr></thead>
+      <tbody>
+        <tr><td class="symbol">ZYBT</td><td class="num">1.58</td><td class="num up">+6.76%</td><td class="num">235,520</td><td class="num">7.70M</td><td class="num">1.49%</td></tr>
+<tr><td class="symbol">SKYA</td><td class="num">2.52</td><td class="num down">-3.64%</td><td class="num">1,323,874</td><td class="num">25.40M</td><td class="num">2.13%</td></tr>
+      </tbody>
+    </table>
+<h2>9 SMA <span>2</span></h2>
+    <table>
+      <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th></tr></thead>
+      <tbody>
+        <tr><td class="symbol">OLB</td><td class="num">0.42</td><td class="num down">-17.83%</td><td class="num">5,970,837</td><td class="num">18.74M</td><td class="num">0.97%</td></tr>
+<tr><td class="symbol">XP</td><td class="num">30.23</td><td class="num down">-3.65%</td><td class="num">7,050,759</td><td class="num">386.43M</td><td class="num">4.73%</td></tr>
+      </tbody>
+    </table>
+    <h2>CAPITULATION <span>2</span></h2>
+    <table class="blotter">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Last</th><th>Week</th><th>Volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Blue zone</th><th>Vs avg</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="down fresh"><td class="symbol">USAR <span class="new">New</span></td><td class="num down">10.21</td><td class="num down">−22.8%</td><td class="num">15.5M</td><td class="num">$4.23B</td><td class="num">18.09%</td><td class="num">8.7%</td><td><span class="zone">$9.79–$10.55</span></td><td class="num cyan">19.1%</td></tr>
+<tr class="down"><td class="symbol">IREN</td><td class="num down">30.50</td><td class="num down">−21.2%</td><td class="num">55.8M</td><td class="num">$13.71B</td><td class="num">23.65%</td><td class="num">8.7%</td><td><span class="zone">$29.52–$31.67</span></td><td class="num cyan">13.8%</td></tr>
+      </tbody>
+    </table>
+    <p class="note">Polygon adjusted daily bars. Leveraged ETFs are excluded. Volume is today's share volume. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. Week is the last close versus five sessions earlier. Market cap has to be above $2 billion. Short float is from Finviz. A blue zone is under 20% of the average bar. Names within 15% of the two-year low are left out. All four screens refresh every 15 minutes from 9:30 AM to 4:15 PM ET on weekdays.</p>
+  </main>
+  <script>setInterval(() => location.reload(), 60000);</script>
+</body>
+</html>
