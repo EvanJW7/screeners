@@ -17,15 +17,17 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+SCREENERS = Path("/Users/evanwright/Cursor/screeners")
+sys.path.insert(0, str(SCREENERS / "volume-profile-screener"))
+
 import screener as s
 
 CANVAS_DIR = Path(
     "/Users/evanwright/.cursor/projects/Users-evanwright-Cursor-volume-profile-screener/canvases"
 )
 DASHBOARD = CANVAS_DIR / "capitulation-screen.canvas.tsx"
-PAGE = Path("/Users/evanwright/Cursor/screeners/volume-profile-screener/dashboard.html")
+PAGE = Path(__file__).resolve().parent / "dashboard.html"
 PRIOR_PATH = PAGE.with_name("dashboard-prior.json")
-SCREENERS = Path("/Users/evanwright/Cursor/screeners")
 CENTRAL = s.ZoneInfo("America/Chicago")
 SESSION_OPEN = 9 * 60 + 30
 SESSION_CLOSE = 16 * 60 + 15

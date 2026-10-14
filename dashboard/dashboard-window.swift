@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let web = WKWebView(frame: window.contentView!.bounds)
         web.autoresizingMask = [.width, .height]
         web.setValue(false, forKey: "drawsBackground")
-        let page = URL(fileURLWithPath: "/Users/evanwright/Cursor/screeners/volume-profile-screener/dashboard.html")
+        let page = URL(fileURLWithPath: "/Users/evanwright/Cursor/screeners/dashboard/dashboard.html")
         web.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent())
         window.contentView?.addSubview(web)
 
