@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 SCREENERS = Path("/Users/evanwright/Cursor/screeners")
-sys.path.insert(0, str(SCREENERS / "volume-profile-screener"))
+sys.path.insert(0, str(SCREENERS / "capitulation-screener"))
 
 import screener as s
 
