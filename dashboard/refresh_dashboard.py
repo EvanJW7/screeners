@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run the capitulation screen and rewrite its dashboard.
 
-Weekday sessions only, from 9:30 AM through 4:15 PM Eastern. Pass --force to
-run outside that window.
+Capitulation runs on weekdays from 4:16 AM through 8:16 PM Eastern. The other
+screens stay on the regular session, 9:30 AM through 4:15 PM. Pass --force to
+run outside the capitulation window.
 """
 
 import argparse
@@ -28,9 +29,60 @@ CANVAS_DIR = Path(
 DASHBOARD = CANVAS_DIR / "capitulation-screen.canvas.tsx"
 PAGE = Path(__file__).resolve().parent / "dashboard.html"
 PRIOR_PATH = PAGE.with_name("dashboard-prior.json")
+ZONE_HITS_PATH = PAGE.with_name("dashboard-zone-hits.json")
+ETFIQ = Path(
+    "/Users/evanwright/.cursor/projects/Users-evanwright-Cursor-screeners-volume-profile-screener"
+    "/agent-tools/1feacf93-979a-4b8f-908b-b1186d73296b.txt"
+)
+SKIP_UNDERLYING = {"XRP", "DRAM", "EUV"}
+SKIP_FUND = {"EO"}
 CENTRAL = s.ZoneInfo("America/Chicago")
-SESSION_OPEN = 9 * 60 + 30
-SESSION_CLOSE = 16 * 60 + 15
+SESSION_OPEN = 4 * 60 + 16
+SESSION_CLOSE = 20 * 60 + 16
+REGULAR_OPEN = 9 * 60 + 30
+REGULAR_CLOSE = 16 * 60 + 15
+EXTENDED_CLOSE = 20 * 60
+
+
+def fund_aum(raw: str) -> float:
+    text = raw.strip().replace("$", "").replace(",", "")
+    if not text or text in {"–", "—", "-"}:
+        return 0.0
+    match = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*([mb])?", text, re.I)
+    if not match:
+        return 0.0
+    value = float(match.group(1))
+    unit = (match.group(2) or "").lower()
+    if unit == "b":
+        return value * 1_000_000_000
+    if unit == "m":
+        return value * 1_000_000
+    return value
+
+
+def leveraged_etfs() -> dict[str, str]:
+    """Largest 2x long fund for each underlying, by net assets."""
+    grouped: dict[str, list[tuple[float, str]]] = {}
+    if not ETFIQ.exists():
+        s.log(f"2x ETF list missing at {ETFIQ}")
+        return {}
+    for line in ETFIQ.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("| ") or line.startswith("| ---") or line.startswith("| Ticker"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 15:
+            continue
+        ticker, assets, multiple, underlying = cells[0], cells[4], cells[13], cells[14]
+        if multiple != "+2x" or ticker in SKIP_FUND or underlying in SKIP_UNDERLYING:
+            continue
+        if not re.fullmatch(r"[A-Z]{1,6}", underlying):
+            continue
+        grouped.setdefault(underlying, []).append((fund_aum(assets), ticker))
+    mapped = {}
+    for underlying, funds in grouped.items():
+        funds.sort(key=lambda item: item[0], reverse=True)
+        mapped[underlying] = funds[0][1]
+    return mapped
 
 
 def session_is_open(moment: datetime) -> bool:
@@ -38,6 +90,120 @@ def session_is_open(moment: datetime) -> bool:
         return False
     minutes = moment.hour * 60 + moment.minute
     return SESSION_OPEN <= minutes <= SESSION_CLOSE
+
+
+def regular_session(moment: datetime) -> bool:
+    if moment.weekday() >= 5:
+        return False
+    minutes = moment.hour * 60 + moment.minute
+    return REGULAR_OPEN <= minutes <= REGULAR_CLOSE
+
+
+def quote_time(stamp: float) -> datetime:
+    if stamp > 1e17:
+        stamp /= 1e9
+    elif stamp > 1e14:
+        stamp /= 1e6
+    elif stamp > 1e11:
+        stamp /= 1e3
+    return datetime.fromtimestamp(stamp, s.EASTERN)
+
+
+def live_quotes(api_key: str, as_of: date) -> dict[str, dict]:
+    """Latest 4:00 a.m. to 8:00 p.m. trade from the current minute bar."""
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    quotes: dict[str, dict] = {}
+    while url:
+        response = s.requests.get(url, params={"apiKey": api_key}, timeout=90)
+        if response.status_code == 429:
+            s.time.sleep(12)
+            continue
+        response.raise_for_status()
+        body = response.json()
+        for row in body.get("tickers") or []:
+            symbol = s.normalize_symbol(str(row.get("ticker") or ""))
+            minute = row.get("min") or {}
+            price = minute.get("c")
+            stamp = minute.get("t")
+            if not symbol or not price or stamp is None:
+                continue
+            when = quote_time(float(stamp))
+            if when.date() != as_of:
+                continue
+            volume = minute.get("av")
+            quotes[symbol] = {
+                "price": float(price),
+                "volume": float(volume or 0),
+                "day": as_of,
+            }
+        url = body.get("next_url")
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return quotes
+
+
+def apply_extended(hours: s.ExtendedHours, symbol: str, dated: list, as_of: date):
+    """Replace daily highs and lows with the 4:00 a.m. to 8:00 p.m. range."""
+    if not dated:
+        return dated, None
+    spans = hours.spans(symbol, dated[0][0], as_of, live_day=as_of)
+    rebuilt = []
+    for day, (close, volume, high, low, open_price) in dated:
+        span = spans.get(day)
+        if span is not None:
+            high = max(high, span[0])
+            low = min(low, span[1])
+        rebuilt.append((day, (close, volume, high, low, open_price)))
+    today = spans.get(as_of)
+    return rebuilt, None if today is None else today[1]
+
+
+def extend_chart_bars(
+    hours: s.ExtendedHours,
+    symbol: str,
+    bars: list[tuple],
+    as_of: date,
+    price: float,
+    volume: float,
+) -> list[tuple]:
+    if not bars:
+        return bars
+    start = date.fromisoformat(bars[0][0])
+    spans = hours.spans(symbol, start, as_of, live_day=as_of)
+    widened = []
+    for day, open_price, high, low, close, bar_volume in bars:
+        span = spans.get(date.fromisoformat(day))
+        if span is not None:
+            high = max(high, span[0])
+            low = min(low, span[1])
+        if day == as_of.isoformat():
+            close = price
+            high = max(high, price)
+            low = min(low, price)
+            if volume > 0:
+                bar_volume = volume
+        widened.append((day, open_price, high, low, close, bar_volume))
+    if widened[-1][0] < as_of.isoformat():
+        span = spans.get(as_of)
+        high = max(span[0], price) if span else price
+        low = min(span[1], price) if span else price
+        widened.append((as_of.isoformat(), price, high, low, price, volume))
+    return widened
+
+
+def previous_other_sections() -> str:
+    """Keep the regular-session screens when capitulation refreshes outside that window."""
+    if not PAGE.exists():
+        return ""
+    text = PAGE.read_text(encoding="utf-8")
+    main = text.find("<main>")
+    heading = text.find("<h2>CAPITULATION", main if main >= 0 else 0)
+    if main < 0 or heading < 0:
+        return ""
+    section = text.rfind("<section", main, heading)
+    if section < 0:
+        return ""
+    return text[main + len("<main>"):section]
 
 
 def short_name(raw: str) -> str:
@@ -225,6 +391,7 @@ def render_chart(
     profile_end: date,
     screen_day: date,
     in_progress: bool,
+    years: int = 2,
 ) -> str:
     profile_rows = [bar for bar in price_bars if bar[0] <= profile_end.isoformat()]
     profile_input = [(bar[4], bar[5], bar[2], bar[3], bar[1]) for bar in profile_rows]
@@ -334,7 +501,7 @@ export default function {name}() {{
       <Stack gap={{6}}>
         <H1>{symbol} blue zone</H1>
         <Text tone="secondary">
-          {title} daily closes from {{BARS[0][0]}} through {session_note}. The volume profile is the two years through {profile_label}, before this week's decline. A blue zone is a bar shorter than 20% of the average bar.
+          {title} from {{BARS[0][0]}} through {session_note}. Highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. The volume profile is the {"three" if years == 3 else "two"} years through {profile_label}, before this week's decline. A blue zone is a bar shorter than 20% of the average bar. The close passes when it sits in one, or within 4 bars of one, on the two-year or three-year profile.
         </Text>
       </Stack>
       <Row gap={{24}} align="end">
@@ -387,11 +554,11 @@ export default function {name}() {{
       </svg>
       <Row gap={{16}} align="center">
         <Text size="small" tone="secondary">Close</Text>
-        <Text size="small" tone="tertiary">Daily high–low</Text>
+        <Text size="small" tone="tertiary">4:00 a.m.–8:00 p.m. high and low</Text>
         <Text size="small" tone="tertiary">Blue bars are under 20% of the average bar</Text>
       </Row>
       <Text size="small" tone="tertiary">
-        Source: Polygon adjusted daily bars. The profile stops on {profile_label}, so this week's selling is not part of the average. {screen_label}{" is still in progress." if in_progress else "."}
+        Source: Polygon adjusted daily volume, with highs and lows from 4:00 a.m. to 8:00 p.m. Eastern. The profile stops on {profile_label}, so this week's selling is not part of the average. {screen_label}{" is still in progress." if in_progress else "."}
       </Text>
     </Stack>
   );
@@ -403,8 +570,226 @@ def week_text(change: float) -> str:
     return f"−{abs(change):.1f}%" if change < 0 else f"+{change:.1f}%"
 
 
+def day_text(change: float | None) -> str:
+    if change is None:
+        return "—"
+    return f"−{abs(change):.2f}%" if change < 0 else f"+{change:.2f}%"
+
+
+def tone(change: float | None) -> str:
+    if change is None or change == 0:
+        return ""
+    return "down" if change < 0 else "up"
+
+
 def format_cap(cap: float) -> str:
     return f"${cap / 1_000_000_000:.2f}B"
+
+
+def versus_text(value: float | None) -> str:
+    return "—" if value is None else f"{value:.1f}%"
+
+
+def zone_cell(label: str | None) -> str:
+    if not label:
+        return '<td class="num">—</td>'
+    return f'<td><span class="zone">{html.escape(label)}</span></td>'
+
+
+def versus_cell(value: float | None) -> str:
+    if value is None:
+        return '<td class="num">—</td>'
+    return f'<td class="num cyan">{value:.1f}%</td>'
+
+
+def zone_bounds(label: str | None) -> tuple[float, float] | None:
+    if not label:
+        return None
+    parts = re.split(r"[–-]", label.replace("$", "").replace(",", ""))
+    if len(parts) != 2:
+        return None
+    try:
+        low, high = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    return low, high
+
+
+def price_in_zone(price: float, label: str | None) -> bool:
+    bounds = zone_bounds(label)
+    if bounds is None:
+        return False
+    low, high = bounds
+    return low <= price <= high
+
+
+def range_overlaps_zone(high: float, low: float, label: str | None) -> bool:
+    bounds = zone_bounds(label)
+    if bounds is None:
+        return False
+    zone_low, zone_high = bounds
+    return low <= zone_high and high >= zone_low
+
+
+def print_in_zone(high: float, low: float, close: float, zone_two: str | None, zone_three: str | None) -> float | None:
+    """A price from this bar that traded inside either zone."""
+    if price_in_zone(close, zone_two) or price_in_zone(close, zone_three):
+        return close
+    if price_in_zone(low, zone_two) or price_in_zone(low, zone_three):
+        return low
+    if price_in_zone(high, zone_two) or price_in_zone(high, zone_three):
+        return high
+    if range_overlaps_zone(high, low, zone_two) or range_overlaps_zone(high, low, zone_three):
+        return low
+    return None
+
+
+def first_zone_print(
+    api_key: str,
+    symbol: str,
+    day: date,
+    zone_two: str | None,
+    zone_three: str | None,
+) -> tuple[datetime, float] | None:
+    """First 4:00 a.m. to 8:00 p.m. print that traded inside either zone."""
+    start = datetime.combine(day, datetime.min.time(), s.EASTERN).replace(hour=4)
+    end = start.replace(hour=20)
+    url = (
+        "https://api.polygon.io/v2/aggs/ticker/"
+        f"{symbol}/range/1/minute/{int(start.timestamp() * 1000)}/{int(end.timestamp() * 1000)}"
+    )
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key}
+    while url:
+        response = s.requests.get(url, params=params, timeout=90)
+        if response.status_code == 429:
+            s.time.sleep(10)
+            continue
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        if response.status_code != 200:
+            s.log(f"{symbol}: zone scan failed ({response.status_code})")
+            return None
+        for row in body.get("results") or []:
+            stamp, high, low, close = row.get("t"), row.get("h"), row.get("l"), row.get("c")
+            if None in (stamp, high, low, close):
+                continue
+            when = datetime.fromtimestamp(float(stamp) / 1000, s.EASTERN)
+            minute = when.hour * 60 + when.minute
+            if minute < 4 * 60 or minute >= 20 * 60:
+                continue
+            touch = print_in_zone(float(high), float(low), float(close), zone_two, zone_three)
+            if touch is not None:
+                return when.astimezone(CENTRAL), touch
+        url = body.get("next_url")
+        params = None
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return None
+
+
+def change_at(live_price: float, live_change: float | None, touch_price: float) -> float | None:
+    if live_change is None or live_price <= 0 or touch_price <= 0:
+        return live_change
+    base = live_price / (1 + live_change / 100)
+    if base <= 0:
+        return live_change
+    return (touch_price / base - 1) * 100
+
+
+def trading_in_zone(price: float, zone_two: str | None, zone_three: str | None) -> bool:
+    """The live price sits inside the two-year zone or the three-year zone."""
+    return price_in_zone(price, zone_two) or price_in_zone(price, zone_three)
+
+
+def load_zone_hits(screen_day: date) -> list[dict]:
+    try:
+        data = json.loads(ZONE_HITS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict) or data.get("date") != screen_day.isoformat():
+        return []
+    hits = data.get("hits")
+    return [hit for hit in hits if isinstance(hit, dict) and hit.get("symbol")] if isinstance(hits, list) else []
+
+
+def save_zone_hits(screen_day: date, hits: list[dict]) -> None:
+    payload = {"date": screen_day.isoformat(), "hits": hits}
+    write_atomic(ZONE_HITS_PATH, json.dumps(payload, indent=2) + "\n")
+
+
+def record_zone_hits(
+    screen_day: date,
+    matches: list[tuple],
+    etfs: dict[str, str],
+    updated: datetime,
+    api_key: str,
+) -> list[dict]:
+    """Keep the first print that traded inside a zone today, even if price has left it."""
+    hits = load_zone_hits(screen_day)
+    seen = {hit["symbol"] for hit in hits}
+    for (
+        symbol, price, change, _average_volume, _average_range,
+        timeframe, zone_two, versus_two, zone_three, versus_three,
+        _above, _session_volume, _market_cap, day_change, _short_float,
+    ) in matches:
+        if symbol in seen:
+            continue
+        found = first_zone_print(api_key, symbol, screen_day, zone_two, zone_three)
+        if found is None:
+            if not trading_in_zone(price, zone_two, zone_three):
+                continue
+            touch_at, touch_price = updated, price
+        else:
+            touch_at, touch_price = found
+        stamp = touch_at.strftime("%-I:%M %p CT")
+        hits.append({
+            "symbol": symbol,
+            "etf": etfs.get(symbol, "—"),
+            "price": touch_price,
+            "day": change_at(price, day_change, touch_price),
+            "week": change_at(price, change, touch_price),
+            "timeframe": timeframe,
+            "zone_two": zone_two,
+            "versus_two": versus_two,
+            "zone_three": zone_three,
+            "versus_three": versus_three,
+            "hit": stamp,
+        })
+        seen.add(symbol)
+        s.log(f"{symbol}: recorded inside a blue zone at {stamp}")
+    def hit_time(hit: dict) -> datetime:
+        try:
+            return datetime.strptime(str(hit.get("hit") or "").replace(" CT", ""), "%I:%M %p")
+        except ValueError:
+            return datetime.max
+
+    hits.sort(key=hit_time)
+    save_zone_hits(screen_day, hits)
+    return hits
+
+
+def year_average_volumes(api_key: str, symbols: list[str], screen_day: date) -> dict[str, float]:
+    """Mean daily share volume over the 365 days ending on the screen day."""
+    start = screen_day - timedelta(days=365)
+
+    def one(symbol: str) -> tuple[str, float | None]:
+        try:
+            dated = s.fetch_dated_daily(api_key, symbol, start, screen_day)
+        except Exception as error:
+            s.log(f"{symbol}: year volume failed ({error})")
+            return symbol, None
+        volumes = [bar[1] for _day, bar in dated]
+        if len(volumes) < s.MIN_VOLUME_SESSIONS:
+            return symbol, None
+        return symbol, sum(volumes) / len(volumes)
+
+    if not symbols:
+        return {}
+    with s_pool(6) as pool:
+        rows = list(pool.map(one, symbols))
+    return {symbol: value for symbol, value in rows if value is not None}
 
 
 def render_dashboard(
@@ -416,26 +801,40 @@ def render_dashboard(
     declined: int,
     in_progress: bool,
     links: dict[str, Path],
+    year_volumes: dict[str, float] | None = None,
+    etfs: dict[str, str] | None = None,
 ) -> str:
     updated_label = updated.strftime("%-I:%M %p CT").replace("AM", "AM").replace("PM", "PM")
     session_label = screen_day.strftime("%B %-d, %Y")
     base_label = base_day.strftime("%B %-d")
     progress = " The session is still in progress." if in_progress else ""
+    averages = year_volumes or {}
+    funds = etfs or {}
     rows = []
-    for symbol, price, change, _average_volume, average_range, label, versus, _above, session_volume, market_cap, short_float in matches:
+    for (
+        symbol, price, change, _average_volume, average_range,
+        timeframe, zone_two, versus_two, zone_three, versus_three,
+        _above, session_volume, market_cap, day_change, short_float,
+    ) in matches:
         link = links.get(symbol)
         symbol_cell = f'<Text>[{symbol}]({link})</Text>' if link else f'"{symbol}"'
         rows.append(
             "  [\n"
             f"    {symbol_cell},\n"
-            f'    "{price:.2f}",\n'
+            f'    "{funds.get(symbol, "—")}",\n'
+            f'    "{day_text(day_change)}",\n'
             f'    "{week_text(change)}",\n'
+            f'    "{s.format_volume(averages[symbol]) if symbol in averages else "—"}",\n'
             f'    "{s.format_volume(session_volume)}",\n'
             f'    "{format_cap(market_cap)}",\n'
             f'    "{short_float}",\n'
             f'    "{average_range:.1f}%",\n'
-            f'    "{label}",\n'
-            f'    "{versus:.1f}%",\n'
+            f'    "{timeframe}",\n'
+            f'    "{price:.2f}",\n'
+            f'    "{zone_two or "—"}",\n'
+            f'    "{versus_text(versus_two)}",\n'
+            f'    "{zone_three or "—"}",\n'
+            f'    "{versus_text(versus_three)}",\n'
             "  ],"
         )
     row_block = "\n".join(rows)
@@ -443,9 +842,9 @@ def render_dashboard(
     table = ""
     if rows:
         table = f'''      <Table
-        headers={{["Symbol", "Price", "Week", "Volume", "Market cap", "Short float", "Avg range", "Blue zone", "Vs average"]}}
+        headers={{["Symbol", "2x ETF", "Day", "Week", "Avg volume", "Volume", "Market cap", "Short float", "Avg range", "Timeframe", "Price", "2-year zone", "2-year vs avg", "3-year zone", "3-year vs avg"]}}
         rows={{ROWS}}
-        columnAlign={{["left", "right", "right", "right", "right", "right", "right", "left", "right"]}}
+        columnAlign={{["left", "left", "right", "right", "right", "right", "right", "right", "right", "left", "right", "left", "right", "left", "right"]}}
         striped
       />'''
     rows_const = f"const ROWS = [\n{row_block}\n];\n\n" if rows else ""
@@ -459,7 +858,7 @@ def render_dashboard(
       <Stack gap={{6}}>
         <H1>Capitulation screen</H1>
         <Text tone="secondary">
-          Updated {updated_label}. {session_label} versus the {base_label} close.{progress} Refreshes every 15 minutes from 9:30 AM to 4:15 PM ET on weekdays. The symbol opens that name's volume-profile chart.
+          Updated {updated_label}. {session_label} versus the {base_label} close.{progress} Refreshes every 15 minutes from 4:16 AM to 8:16 PM ET on weekdays. The symbol opens that name's volume-profile chart.
         </Text>
       </Stack>
       <Row gap={{24}} align="end" wrap>
@@ -469,7 +868,7 @@ def render_dashboard(
       </Row>
       {table}
       <Text size="small" tone="tertiary">
-        Source: Polygon adjusted daily bars. Leveraged ETFs are excluded. Volume is today's share volume. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. The week is the latest close versus the close five sessions earlier. Market cap has to be above $2 billion. Short float is from Finviz. The profile is the prior two years through {base_label}, {screen_day.year}. A blue zone is a bar shorter than 20% of the average bar. Names within 15% of the two-year low are left out.
+        Source: Polygon adjusted daily volume. Profile highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. Leveraged ETFs are excluded from the screen. The 2x ETF column is the largest 2x long fund for that stock. Avg volume is the mean daily share volume over the last year. Volume is today's shares. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. The week is the latest close versus the close five sessions earlier. Market cap has to be above $2 billion. Short float is from Finviz. The profile is the prior two years or three years through {base_label}, {screen_day.year}. A blue zone is a bar shorter than 20% of the average bar. The close has to sit in one, or within 4 bars of one, on either profile. Names within 15% of the two-year low are left out.
       </Text>
     </Stack>
   );
@@ -555,13 +954,51 @@ def section_table(
         body = "\n".join(lines)
     heads = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
     count = "—" if rows is None else str(len(rows))
-    return f'''<h2>{html.escape(noun)} <span>{count}</span></h2>
+    return f'''<section class="panel">
+    <h2>{html.escape(noun)} <span>{count}</span></h2>
     <table>
       <thead><tr>{heads}</tr></thead>
       <tbody>
         {body}
       </tbody>
-    </table>'''
+    </table>
+    </section>'''
+
+
+def render_zone_log(hits: list[dict]) -> str:
+    body = []
+    for hit in hits:
+        week = hit.get("week")
+        body.append(
+            "<tr>"
+            f'<td class="symbol">{html.escape(str(hit.get("symbol") or ""))}</td>'
+            f'<td class="symbol">{html.escape(str(hit.get("etf") or "—"))}</td>'
+            f'<td>{html.escape(str(hit.get("hit") or "—"))}</td>'
+            f'<td class="num">{float(hit["price"]):.2f}</td>'
+            f'<td class="num {tone(hit.get("day"))}">{day_text(hit.get("day"))}</td>'
+            f'<td class="num {tone(week)}">{week_text(week) if week is not None else "—"}</td>'
+            f'<td>{html.escape(str(hit.get("timeframe") or "—"))}</td>'
+            f'{zone_cell(hit.get("zone_two"))}'
+            f'{versus_cell(hit.get("versus_two"))}'
+            f'{zone_cell(hit.get("zone_three"))}'
+            f'{versus_cell(hit.get("versus_three"))}'
+            "</tr>"
+        )
+    rows = "\n".join(body) if body else '<tr><td colspan="11" class="empty">No name has traded inside a zone today.</td></tr>'
+    return f'''<section class="panel">
+    <h2>HIT THE ZONE <span>{len(hits)}</span></h2>
+    <table class="zone-log">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>2x ETF</th><th>Hit</th><th>Last</th><th>Day</th><th>Week</th><th>Timeframe</th><th>2-year zone</th><th>2-year vs avg</th><th>3-year zone</th><th>3-year vs avg</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+    <p class="note">The first time each name's price traded inside its two-year or three-year zone today. It stays here after the price leaves.</p>
+    </section>'''
 
 
 def render_page(
@@ -574,6 +1011,9 @@ def render_page(
     in_progress: bool,
     extra: str = "",
     fresh: set[str] | None = None,
+    year_volumes: dict[str, float] | None = None,
+    etfs: dict[str, str] | None = None,
+    zone_hits: list[dict] | None = None,
 ) -> str:
     updated_label = updated.strftime("%-I:%M %p CT")
     session_label = screen_day.strftime("%b %-d, %Y")
@@ -581,29 +1021,44 @@ def render_page(
     status = "SESSION OPEN" if in_progress else "SESSION CLOSED"
     status_class = "live" if in_progress else "closed"
     arrived = fresh or set()
+    averages = year_volumes or {}
+    funds = etfs or {}
+    zone_log = render_zone_log(zone_hits or [])
     body = []
     for (
         symbol, price, change, _average_volume, average_range,
-        label, versus, _above, session_volume, market_cap, short_float,
+        timeframe, zone_two, versus_two, zone_three, versus_three,
+        _above, session_volume, market_cap, day_change, short_float,
     ) in matches:
-        move = "down" if change < 0 else "up"
         is_new = symbol in arrived
         new_mark = ' <span class="new">New</span>' if is_new else ""
-        row_class = f"{move} fresh" if is_new else move
+        classes = []
+        if is_new:
+            classes.append("fresh")
+        if trading_in_zone(price, zone_two, zone_three):
+            classes.append("in-zone")
+        row_class = " ".join(classes)
+        fund = funds.get(symbol, "—")
         body.append(
             f'<tr class="{row_class}">'
             f'<td class="symbol">{html.escape(symbol)}{new_mark}</td>'
-            f'<td class="num {move}">{price:.2f}</td>'
-            f'<td class="num {move}">{week_text(change)}</td>'
+            f'<td class="symbol">{html.escape(fund)}</td>'
+            f'<td class="num {tone(day_change)}">{day_text(day_change)}</td>'
+            f'<td class="num {tone(change)}">{week_text(change)}</td>'
+            f'<td class="num">{s.format_volume(averages[symbol]) if symbol in averages else "—"}</td>'
             f'<td class="num">{s.format_volume(session_volume)}</td>'
             f'<td class="num">{format_cap(market_cap)}</td>'
             f'<td class="num">{html.escape(short_float)}</td>'
             f'<td class="num">{average_range:.1f}%</td>'
-            f'<td><span class="zone">{html.escape(label)}</span></td>'
-            f'<td class="num cyan">{versus:.1f}%</td>'
+            f'<td>{html.escape(timeframe)}</td>'
+            f'<td class="num">{price:.2f}</td>'
+            f'{zone_cell(zone_two)}'
+            f'{versus_cell(versus_two)}'
+            f'{zone_cell(zone_three)}'
+            f'{versus_cell(versus_three)}'
             "</tr>"
         )
-    rows = "\n".join(body) if body else '<tr><td colspan="9" class="empty">No names passed this run.</td></tr>'
+    rows = "\n".join(body) if body else '<tr><td colspan="15" class="empty">No names passed this run.</td></tr>'
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -625,66 +1080,116 @@ def render_page(
     body {{
       margin: 0;
       min-height: 100vh;
-      background: var(--bg);
+      background:
+        radial-gradient(980px 280px at 0% 0%, rgba(76, 195, 255, 0.10), transparent 58%),
+        radial-gradient(720px 240px at 100% 0%, rgba(0, 184, 92, 0.06), transparent 50%),
+        var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
     header {{
+      position: sticky;
+      top: 0;
+      z-index: 3;
       display: flex;
       align-items: center;
-      gap: 16px;
-      padding: 16px 24px;
-      background: #10161c;
+      gap: 14px;
+      padding: 14px 22px;
+      background: rgba(12, 15, 18, 0.88);
       border-bottom: 1px solid var(--line);
+      box-shadow: inset 0 -1px 0 rgba(76, 195, 255, 0.45);
+      backdrop-filter: blur(18px);
     }}
     header h1 {{
       margin: 0;
-      font-size: 16px;
-      letter-spacing: 0.02em;
+      font-size: 15px;
+      letter-spacing: 0.18em;
       font-weight: 700;
+      text-transform: uppercase;
     }}
     .badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
       font-size: 11px;
       font-weight: 700;
       letter-spacing: 0.08em;
-      padding: 4px 8px;
-      border-radius: 3px;
+      padding: 5px 9px;
+      border-radius: 999px;
     }}
     .badge.live {{ color: #04140a; background: var(--up); }}
     .badge.closed {{ color: #1a1208; background: var(--gold); }}
+    .pip {{
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }}
+    .badge.live .pip {{ animation: pulse 1.6s ease-out infinite; }}
+    @keyframes pulse {{
+      0% {{ box-shadow: 0 0 0 0 rgba(4, 20, 10, 0.55); }}
+      70% {{ box-shadow: 0 0 0 6px rgba(4, 20, 10, 0); }}
+      100% {{ box-shadow: 0 0 0 0 rgba(4, 20, 10, 0); }}
+    }}
     .clock {{ margin-left: auto; color: #ffffff; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }}
-    main {{ padding: 20px 24px 32px; }}
+    main {{ padding: 18px 22px 36px; display: flex; flex-direction: column; gap: 16px; }}
+    .panel {{
+      background:
+        linear-gradient(180deg, rgba(76, 195, 255, 0.06), transparent 48px),
+        var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      overflow: hidden;
+      background: transparent;
     }}
     th {{
       text-align: right;
-      padding: 10px 14px;
+      padding: 9px 14px 11px;
       color: var(--muted);
       font-size: 11px;
       font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       border-bottom: 1px solid var(--line);
-      background: #10161c;
+      background: rgba(16, 22, 28, 0.72);
     }}
     td {{
-      padding: 12px 14px;
+      padding: 11px 14px;
       border-bottom: 1px solid #1c262e;
       font-variant-numeric: tabular-nums;
       font-size: 15px;
     }}
+    tbody tr:last-child td {{ border-bottom: 0; }}
+    tbody tr:hover td {{ background: #1a232c; }}
     th:first-child, td:first-child {{ text-align: left; }}
-    table.blotter th:nth-child(8), table.blotter td:nth-child(8) {{ text-align: left; }}
-    tr.down td.symbol {{ border-left: 3px solid var(--down); }}
-    tr.up td.symbol {{ border-left: 3px solid var(--up); }}
+    table.blotter td {{ color: #ffffff; }}
+    table.blotter td.up {{ color: var(--up); }}
+    table.blotter td.down {{ color: var(--down); }}
+    table.blotter .cyan, table.blotter .zone {{ color: var(--cyan); }}
+    table.blotter th:nth-child(2), table.blotter td:nth-child(2),
+    table.blotter th:nth-child(10), table.blotter td:nth-child(10),
+    table.blotter th:nth-child(12), table.blotter td:nth-child(12),
+    table.blotter th:nth-child(14), table.blotter td:nth-child(14) {{ text-align: left; }}
     tr.fresh td {{ background: #2c2618; }}
-    .symbol {{ font-weight: 700; letter-spacing: 0.04em; }}
+    tr.fresh:hover td {{ background: #3a3222; }}
+    table.blotter tr.in-zone td {{ background: #123848; }}
+    table.blotter tr.in-zone:hover td {{ background: #18506a; }}
+    table.blotter tr.in-zone td:first-child {{ box-shadow: inset 3px 0 0 var(--cyan); }}
+    table.zone-log th:nth-child(2), table.zone-log td:nth-child(2),
+    table.zone-log th:nth-child(3), table.zone-log td:nth-child(3),
+    table.zone-log th:nth-child(7), table.zone-log td:nth-child(7),
+    table.zone-log th:nth-child(8), table.zone-log td:nth-child(8),
+    table.zone-log th:nth-child(10), table.zone-log td:nth-child(10) {{ text-align: left; }}
+    .symbol {{
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+    }}
     .new {{
       color: #1a1208;
       background: var(--gold);
@@ -693,8 +1198,8 @@ def render_page(
       letter-spacing: 0.06em;
       text-transform: uppercase;
       margin-left: 8px;
-      padding: 1px 5px;
-      border-radius: 2px;
+      padding: 2px 6px;
+      border-radius: 999px;
       vertical-align: 1px;
     }}
     .num {{ text-align: right; font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
@@ -706,45 +1211,172 @@ def render_page(
       color: var(--cyan);
       background: #102734;
       border: 1px solid #1d4d66;
-      border-radius: 3px;
-      padding: 2px 8px;
+      border-radius: 999px;
+      padding: 3px 9px;
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       font-size: 13px;
     }}
     .empty {{ color: var(--muted); text-align: left; }}
     h2 {{
-      margin: 28px 0 10px;
-      font-size: 13px;
-      letter-spacing: 0.12em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0;
+      padding: 13px 16px 11px;
+      font-size: 12px;
+      letter-spacing: 0.16em;
       font-weight: 700;
     }}
-    h2 span {{ color: var(--cyan); margin-left: 8px; font-variant-numeric: tabular-nums; }}
-    main h2:first-of-type {{ margin-top: 0; }}
-    .note {{ color: var(--muted); font-size: 12px; margin: 14px 2px 0; max-width: 860px; line-height: 1.45; }}
+    h2 span {{
+      margin-left: auto;
+      color: var(--cyan);
+      min-width: 1.7em;
+      padding: 2px 8px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0;
+      background: rgba(76, 195, 255, 0.12);
+      border: 1px solid rgba(76, 195, 255, 0.38);
+      border-radius: 999px;
+    }}
+    .hide {{
+      margin-left: 10px;
+      border: 0;
+      padding: 0 4px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+    }}
+    .hide:hover {{ color: var(--text); }}
+    tr.hidden {{ display: none; }}
+    .show-hidden {{
+      margin-left: 8px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+    }}
+    .show-hidden:hover {{ color: var(--text); border-color: var(--muted); }}
+    .note {{
+      color: var(--muted);
+      font-size: 12px;
+      margin: 2px 4px 0;
+      max-width: 920px;
+      line-height: 1.5;
+    }}
   </style>
 </head>
 <body>
   <header>
     <h1>Main Dashboard</h1>
-    <span class="badge {status_class}">{status}</span>
+    <span class="badge {status_class}"><i class="pip"></i>{status}</span>
     <span class="clock">Last refresh: {updated_label}</span>
   </header>
   <main>
     {extra}
+    <section class="panel">
     <h2>CAPITULATION <span>{len(matches)}</span></h2>
     <table class="blotter">
       <thead>
         <tr>
-          <th>Symbol</th><th>Last</th><th>Week</th><th>Volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Blue zone</th><th>Vs avg</th>
+          <th>Symbol</th><th>2x ETF</th><th>Day</th><th>Week</th><th>Avg volume</th><th>Volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Timeframe</th><th>Last</th><th>2-year zone</th><th>2-year vs avg</th><th>3-year zone</th><th>3-year vs avg</th>
         </tr>
       </thead>
       <tbody>
         {rows}
       </tbody>
     </table>
-    <p class="note">Polygon adjusted daily bars. Leveraged ETFs are excluded. Volume is today's share volume. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. Week is the last close versus five sessions earlier. Market cap has to be above $2 billion. Short float is from Finviz. A blue zone is under 20% of the average bar. Names within 15% of the two-year low are left out. All four screens refresh every 15 minutes from 9:30 AM to 4:15 PM ET on weekdays.</p>
+    </section>
+    {zone_log}
   </main>
-  <script>setInterval(() => location.reload(), 60000);</script>
+  <script>
+    const hiddenKey = "dashboard-hidden-rows";
+    function readHidden() {{
+      try {{
+        const data = JSON.parse(localStorage.getItem(hiddenKey) || "{{}}");
+        return data && typeof data === "object" ? data : {{}};
+      }} catch (error) {{
+        return {{}};
+      }}
+    }}
+    function writeHidden(data) {{
+      localStorage.setItem(hiddenKey, JSON.stringify(data));
+    }}
+    function screenName(section) {{
+      const copy = section.querySelector("h2").cloneNode(true);
+      copy.querySelectorAll("span, button").forEach((node) => node.remove());
+      return copy.textContent.trim();
+    }}
+    function tickerOf(row) {{
+      const cell = row.querySelector(".symbol");
+      if (!cell) return "";
+      const copy = cell.cloneNode(true);
+      copy.querySelectorAll(".new, .hide").forEach((node) => node.remove());
+      return copy.textContent.trim();
+    }}
+    function paint() {{
+      const hidden = readHidden();
+      document.querySelectorAll("section.panel").forEach((section) => {{
+        const name = screenName(section);
+        const gone = new Set(hidden[name] || []);
+        let count = 0;
+        section.querySelectorAll("tbody tr").forEach((row) => {{
+          const ticker = tickerOf(row);
+          if (!ticker) return;
+          let button = row.querySelector(".hide");
+          if (!button) {{
+            button = document.createElement("button");
+            button.type = "button";
+            button.className = "hide";
+            button.textContent = "×";
+            row.querySelector(".symbol").appendChild(button);
+          }}
+          button.setAttribute("aria-label", "Hide " + ticker);
+          const isHidden = gone.has(ticker);
+          row.classList.toggle("hidden", isHidden);
+          if (isHidden) count += 1;
+        }});
+        let restore = section.querySelector(".show-hidden");
+        if (!restore) {{
+          restore = document.createElement("button");
+          restore.type = "button";
+          restore.className = "show-hidden";
+          section.querySelector("h2").appendChild(restore);
+        }}
+        restore.hidden = count === 0;
+        restore.textContent = count === 1 ? "Show 1 hidden" : "Show " + count + " hidden";
+      }});
+    }}
+    document.addEventListener("click", (event) => {{
+      const hide = event.target.closest(".hide");
+      if (hide) {{
+        const section = hide.closest("section.panel");
+        const name = screenName(section);
+        const ticker = tickerOf(hide.closest("tr"));
+        const hidden = readHidden();
+        const list = new Set(hidden[name] || []);
+        list.add(ticker);
+        hidden[name] = Array.from(list);
+        writeHidden(hidden);
+        paint();
+        return;
+      }}
+      const restore = event.target.closest(".show-hidden");
+      if (!restore) return;
+      const hidden = readHidden();
+      delete hidden[screenName(restore.closest("section.panel"))];
+      writeHidden(hidden);
+      paint();
+    }});
+    paint();
+    setInterval(() => location.reload(), 60000);
+  </script>
 </body>
 </html>
 '''
@@ -919,20 +1551,63 @@ def safe_screen(label: str, fn, as_of: date):
         return None
 
 
+PARABOLIC_HEADERS = ["Ticker", "Last", "Day", "Volume", "Float", "Short float", "5 day %"]
+
+
+def parabolic_rows(as_of: date) -> list[list[tuple[str, str]]]:
+    mod = load_screener("parabolic_shorts", "parabolic-shorts")
+    universe = mod.load_symbols()
+    sessions = mod.load_sessions(mod.load_api_key(), as_of)
+    matches = mod.find_matches(universe, sessions)
+    previous = sessions[1][1]
+    pending = []
+    for symbol, close, _prior, change, volume in matches:
+        earlier = previous.get(symbol)
+        if earlier is not None and earlier[0] > 0:
+            day = f"{(close / earlier[0] - 1.0) * 100:+.2f}%"
+        else:
+            day = "—"
+        pending.append({
+            "Symbol": symbol,
+            "Price": f"{close:.2f}",
+            "Day": day,
+            "Volume": f"{round(volume):,}",
+            "Five": f"{change:+.1f}%",
+        })
+    nine = load_screener("nine_sma_finviz", "9sma-screener")
+    with s_pool(6) as pool:
+        detailed = list(pool.map(nine.add_finviz, pending))
+    rows = []
+    for row in detailed:
+        rows.append([
+            (row["Symbol"], "symbol"),
+            (row["Price"], "num"),
+            (row["Day"], f"num {pct_class(row['Day'])}"),
+            (row["Volume"], "num"),
+            (row.get("Finviz Shares Float") or "—", "num"),
+            (row.get("Finviz Short % of Float") or "—", "num"),
+            (row["Five"], f"num {pct_class(row['Five'])}"),
+        ])
+    return rows
+
+
 def other_sections(as_of: date) -> tuple[str, dict[str, list[str] | None]]:
     inside = safe_screen("Inside day", inside_day_rows, as_of)
     double = safe_screen("Double inside day", double_inside_rows, as_of)
     sma = safe_screen("9 SMA", nine_sma_rows, as_of)
+    parabolic = safe_screen("Parabolic shorts", parabolic_rows, as_of)
     sections = {
         "inside": None if inside is None else [row[0][0] for row in inside],
         "double": None if double is None else [row[0][0] for row in double],
         "sma": None if sma is None else [row[0][0] for row in sma],
+        "parabolic": None if parabolic is None else [row[0][0] for row in parabolic],
     }
     prior = load_prior()
     page = "\n".join([
         section_table(SCREEN_HEADERS, inside, "INSIDE DAY", fresh_names("inside", sections["inside"], prior)),
         section_table(SCREEN_HEADERS, double, "DOUBLE INSIDE DAY", fresh_names("double", sections["double"], prior)),
         section_table(SCREEN_HEADERS, sma, "9 SMA", fresh_names("sma", sections["sma"], prior)),
+        section_table(PARABOLIC_HEADERS, parabolic, "PARABOLIC SHORTS", fresh_names("parabolic", sections["parabolic"], prior)),
     ])
     return page, sections
 
@@ -943,10 +1618,25 @@ def refresh(force: bool) -> None:
         s.log("Outside the weekday session; the dashboard stays as it is")
         return
     as_of = now_eastern.date()
+    api_key = s.load_api_key()
+    quotes = live_quotes(api_key, as_of)
+    s.log(f"Live trades today: {len(quotes)}")
+    if len(quotes) < 100:
+        s.log("Live prices were too thin, so the screen uses the latest daily close")
+        quotes = None
+    hours = s.ExtendedHours(api_key)
+
+    def adjust_bars(symbol: str, dated: list):
+        try:
+            return apply_extended(hours, symbol, dated, as_of)
+        except Exception as error:
+            s.log(f"{symbol}: extended hours failed ({error})")
+            return dated, None
+
     last_error = None
     for attempt in range(2):
         try:
-            screen_day, base_day, matches, liquid, declined = s.run_screen(as_of)
+            screen_day, base_day, matches, liquid, declined = s.run_screen(as_of, quotes, adjust_bars)
             break
         except Exception as error:
             last_error = error
@@ -954,27 +1644,37 @@ def refresh(force: bool) -> None:
             s.time.sleep(8)
     else:
         raise last_error
-    in_progress = screen_day == as_of and now_eastern.hour * 60 + now_eastern.minute < 16 * 60
+    in_progress = screen_day == as_of and now_eastern.hour * 60 + now_eastern.minute < EXTENDED_CLOSE
+    etfs = leveraged_etfs()
     names = security_names()
-    api_key = s.load_api_key()
-    profile_start = base_day - timedelta(days=365 * s.PROFILE_YEARS)
     links: dict[str, Path] = {}
     for match in matches:
         symbol = match[0]
+        years = 3 if match[5] == "3 year" else 2
         try:
-            bars = fetch_dated(api_key, symbol, profile_start, screen_day)
-            chart = render_chart(symbol, names.get(symbol, symbol), bars, base_day, screen_day, in_progress)
+            bars = fetch_dated(api_key, symbol, base_day - timedelta(days=365 * years), screen_day)
+            bars = extend_chart_bars(hours, symbol, bars, screen_day, match[1], match[11])
+            chart = render_chart(symbol, names.get(symbol, symbol), bars, base_day, screen_day, in_progress, years)
             path = chart_path(symbol)
             write_atomic(path, chart)
             links[symbol] = path
         except Exception as error:
             s.log(f"{symbol}: chart skipped ({error})")
+    hours.save()
     matches = attach_short_float(matches)
-    extra, sections = other_sections(as_of)
+    matches.sort(key=lambda match: match[13] if match[13] is not None else float("inf"))
+    year_volumes = year_average_volumes(api_key, [match[0] for match in matches], screen_day)
+    if regular_session(now_eastern):
+        extra, sections = other_sections(as_of)
+    else:
+        extra = previous_other_sections()
+        prior_sections = load_prior()
+        sections = {key: prior_sections.get(key) for key in ("inside", "double", "sma", "parabolic")}
     prior = load_prior()
     sections["capitulation"] = [match[0] for match in matches]
     updated = datetime.now(CENTRAL)
-    dashboard = render_dashboard(updated, screen_day, base_day, matches, liquid, declined, in_progress, links)
+    zone_hits = record_zone_hits(screen_day, matches, etfs, updated, api_key)
+    dashboard = render_dashboard(updated, screen_day, base_day, matches, liquid, declined, in_progress, links, year_volumes, etfs)
     write_atomic(DASHBOARD, dashboard)
     page = render_page(
         updated,
@@ -986,6 +1686,9 @@ def refresh(force: bool) -> None:
         in_progress,
         extra,
         fresh_names("capitulation", sections["capitulation"], prior),
+        year_volumes,
+        etfs,
+        zone_hits,
     )
     write_atomic(PAGE, page)
     save_prior(sections)

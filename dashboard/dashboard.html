@@ -19,66 +19,116 @@
     body {
       margin: 0;
       min-height: 100vh;
-      background: var(--bg);
+      background:
+        radial-gradient(980px 280px at 0% 0%, rgba(76, 195, 255, 0.10), transparent 58%),
+        radial-gradient(720px 240px at 100% 0%, rgba(0, 184, 92, 0.06), transparent 50%),
+        var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     header {
+      position: sticky;
+      top: 0;
+      z-index: 3;
       display: flex;
       align-items: center;
-      gap: 16px;
-      padding: 16px 24px;
-      background: #10161c;
+      gap: 14px;
+      padding: 14px 22px;
+      background: rgba(12, 15, 18, 0.88);
       border-bottom: 1px solid var(--line);
+      box-shadow: inset 0 -1px 0 rgba(76, 195, 255, 0.45);
+      backdrop-filter: blur(18px);
     }
     header h1 {
       margin: 0;
-      font-size: 16px;
-      letter-spacing: 0.02em;
+      font-size: 15px;
+      letter-spacing: 0.18em;
       font-weight: 700;
+      text-transform: uppercase;
     }
     .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
       font-size: 11px;
       font-weight: 700;
       letter-spacing: 0.08em;
-      padding: 4px 8px;
-      border-radius: 3px;
+      padding: 5px 9px;
+      border-radius: 999px;
     }
     .badge.live { color: #04140a; background: var(--up); }
     .badge.closed { color: #1a1208; background: var(--gold); }
+    .pip {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .badge.live .pip { animation: pulse 1.6s ease-out infinite; }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(4, 20, 10, 0.55); }
+      70% { box-shadow: 0 0 0 6px rgba(4, 20, 10, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(4, 20, 10, 0); }
+    }
     .clock { margin-left: auto; color: #ffffff; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }
-    main { padding: 20px 24px 32px; }
+    main { padding: 18px 22px 36px; display: flex; flex-direction: column; gap: 16px; }
+    .panel {
+      background:
+        linear-gradient(180deg, rgba(76, 195, 255, 0.06), transparent 48px),
+        var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+    }
     table {
       width: 100%;
       border-collapse: collapse;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      overflow: hidden;
+      background: transparent;
     }
     th {
       text-align: right;
-      padding: 10px 14px;
+      padding: 9px 14px 11px;
       color: var(--muted);
       font-size: 11px;
       font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       border-bottom: 1px solid var(--line);
-      background: #10161c;
+      background: rgba(16, 22, 28, 0.72);
     }
     td {
-      padding: 12px 14px;
+      padding: 11px 14px;
       border-bottom: 1px solid #1c262e;
       font-variant-numeric: tabular-nums;
       font-size: 15px;
     }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #1a232c; }
     th:first-child, td:first-child { text-align: left; }
-    table.blotter th:nth-child(8), table.blotter td:nth-child(8) { text-align: left; }
-    tr.down td.symbol { border-left: 3px solid var(--down); }
-    tr.up td.symbol { border-left: 3px solid var(--up); }
+    table.blotter td { color: #ffffff; }
+    table.blotter td.up { color: var(--up); }
+    table.blotter td.down { color: var(--down); }
+    table.blotter .cyan, table.blotter .zone { color: var(--cyan); }
+    table.blotter th:nth-child(2), table.blotter td:nth-child(2),
+    table.blotter th:nth-child(10), table.blotter td:nth-child(10),
+    table.blotter th:nth-child(12), table.blotter td:nth-child(12),
+    table.blotter th:nth-child(14), table.blotter td:nth-child(14) { text-align: left; }
     tr.fresh td { background: #2c2618; }
-    .symbol { font-weight: 700; letter-spacing: 0.04em; }
+    tr.fresh:hover td { background: #3a3222; }
+    table.blotter tr.in-zone td { background: #123848; }
+    table.blotter tr.in-zone:hover td { background: #18506a; }
+    table.blotter tr.in-zone td:first-child { box-shadow: inset 3px 0 0 var(--cyan); }
+    table.zone-log th:nth-child(2), table.zone-log td:nth-child(2),
+    table.zone-log th:nth-child(3), table.zone-log td:nth-child(3),
+    table.zone-log th:nth-child(7), table.zone-log td:nth-child(7),
+    table.zone-log th:nth-child(8), table.zone-log td:nth-child(8),
+    table.zone-log th:nth-child(10), table.zone-log td:nth-child(10) { text-align: left; }
+    .symbol {
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+    }
     .new {
       color: #1a1208;
       background: var(--gold);
@@ -87,8 +137,8 @@
       letter-spacing: 0.06em;
       text-transform: uppercase;
       margin-left: 8px;
-      padding: 1px 5px;
-      border-radius: 2px;
+      padding: 2px 6px;
+      border-radius: 999px;
       vertical-align: 1px;
     }
     .num { text-align: right; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
@@ -100,71 +150,226 @@
       color: var(--cyan);
       background: #102734;
       border: 1px solid #1d4d66;
-      border-radius: 3px;
-      padding: 2px 8px;
+      border-radius: 999px;
+      padding: 3px 9px;
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       font-size: 13px;
     }
     .empty { color: var(--muted); text-align: left; }
     h2 {
-      margin: 28px 0 10px;
-      font-size: 13px;
-      letter-spacing: 0.12em;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0;
+      padding: 13px 16px 11px;
+      font-size: 12px;
+      letter-spacing: 0.16em;
       font-weight: 700;
     }
-    h2 span { color: var(--cyan); margin-left: 8px; font-variant-numeric: tabular-nums; }
-    main h2:first-of-type { margin-top: 0; }
-    .note { color: var(--muted); font-size: 12px; margin: 14px 2px 0; max-width: 860px; line-height: 1.45; }
+    h2 span {
+      margin-left: auto;
+      color: var(--cyan);
+      min-width: 1.7em;
+      padding: 2px 8px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0;
+      background: rgba(76, 195, 255, 0.12);
+      border: 1px solid rgba(76, 195, 255, 0.38);
+      border-radius: 999px;
+    }
+    .hide {
+      margin-left: 10px;
+      border: 0;
+      padding: 0 4px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .hide:hover { color: var(--text); }
+    tr.hidden { display: none; }
+    .show-hidden {
+      margin-left: 8px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+    }
+    .show-hidden:hover { color: var(--text); border-color: var(--muted); }
+    .note {
+      color: var(--muted);
+      font-size: 12px;
+      margin: 2px 4px 0;
+      max-width: 920px;
+      line-height: 1.5;
+    }
   </style>
 </head>
 <body>
   <header>
     <h1>Main Dashboard</h1>
-    <span class="badge live">SESSION OPEN</span>
-    <span class="clock">Last refresh: 2:00 PM CT</span>
+    <span class="badge live"><i class="pip"></i>SESSION OPEN</span>
+    <span class="clock">Last refresh: 2:18 PM CT</span>
   </header>
   <main>
-    <h2>INSIDE DAY <span>5</span></h2>
+    <section class="panel">
+    <h2>INSIDE DAY <span>1</span></h2>
     <table>
       <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th></tr></thead>
       <tbody>
-        <tr><td class="symbol">FLYE</td><td class="num">3.59</td><td class="num up">+1.13%</td><td class="num">5,010,623</td><td class="num">1.56M</td><td class="num">2.82%</td></tr>
-<tr><td class="symbol">SKYA</td><td class="num">2.52</td><td class="num down">-3.64%</td><td class="num">1,323,874</td><td class="num">25.40M</td><td class="num">2.13%</td></tr>
-<tr><td class="symbol">AIXI</td><td class="num">2.87</td><td class="num down">-4.55%</td><td class="num">1,130,142</td><td class="num">—</td><td class="num">—</td></tr>
-<tr><td class="symbol">JBDI</td><td class="num">2.49</td><td class="num down">-27.33%</td><td class="num">2,758,366</td><td class="num">—</td><td class="num">—</td></tr>
-<tr><td class="symbol">TCRT</td><td class="num">2.06</td><td class="num down">-31.85%</td><td class="num">65,389,489</td><td class="num">2.43M</td><td class="num">0.40%</td></tr>
+        <tr><td class="symbol">AMTD</td><td class="num">0.55</td><td class="num down">-4.85%</td><td class="num">1,037,057</td><td class="num">24.01M</td><td class="num">0.01%</td></tr>
       </tbody>
     </table>
-<h2>DOUBLE INSIDE DAY <span>2</span></h2>
+    </section>
+<section class="panel">
+    <h2>DOUBLE INSIDE DAY <span>1</span></h2>
     <table>
       <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th></tr></thead>
       <tbody>
-        <tr><td class="symbol">ZYBT</td><td class="num">1.58</td><td class="num up">+6.76%</td><td class="num">235,520</td><td class="num">7.70M</td><td class="num">1.49%</td></tr>
-<tr><td class="symbol">SKYA</td><td class="num">2.52</td><td class="num down">-3.64%</td><td class="num">1,323,874</td><td class="num">25.40M</td><td class="num">2.13%</td></tr>
+        <tr><td class="symbol">BMBL</td><td class="num">5.93</td><td class="num down">-0.67%</td><td class="num">9,763,475</td><td class="num">102.71M</td><td class="num">14.24%</td></tr>
       </tbody>
     </table>
-<h2>9 SMA <span>2</span></h2>
+    </section>
+<section class="panel">
+    <h2>9 SMA <span>3</span></h2>
     <table>
       <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th></tr></thead>
       <tbody>
-        <tr><td class="symbol">OLB</td><td class="num">0.42</td><td class="num down">-17.83%</td><td class="num">5,970,837</td><td class="num">18.74M</td><td class="num">0.97%</td></tr>
-<tr><td class="symbol">XP</td><td class="num">30.23</td><td class="num down">-3.65%</td><td class="num">7,050,759</td><td class="num">386.43M</td><td class="num">4.73%</td></tr>
+        <tr><td class="symbol">OLB</td><td class="num">0.44</td><td class="num up">+4.38%</td><td class="num">4,389,909</td><td class="num">18.74M</td><td class="num">0.97%</td></tr>
+<tr><td class="symbol">PDSB</td><td class="num">1.32</td><td class="num down">-6.03%</td><td class="num">9,144,366</td><td class="num">55.00M</td><td class="num">5.04%</td></tr>
+<tr><td class="symbol">XP</td><td class="num">30.41</td><td class="num down">-0.28%</td><td class="num">6,758,369</td><td class="num">386.43M</td><td class="num">4.73%</td></tr>
       </tbody>
     </table>
+    </section>
+<section class="panel">
+    <h2>PARABOLIC SHORTS <span>0</span></h2>
+    <table>
+      <thead><tr><th>Ticker</th><th>Last</th><th>Day</th><th>Volume</th><th>Float</th><th>Short float</th><th>5 day %</th></tr></thead>
+      <tbody>
+        <tr><td colspan="7" class="empty">No names this run.</td></tr>
+      </tbody>
+    </table>
+    </section>
+    <section class="panel">
     <h2>CAPITULATION <span>2</span></h2>
     <table class="blotter">
       <thead>
         <tr>
-          <th>Symbol</th><th>Last</th><th>Week</th><th>Volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Blue zone</th><th>Vs avg</th>
+          <th>Symbol</th><th>2x ETF</th><th>Day</th><th>Week</th><th>Avg volume</th><th>Volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Timeframe</th><th>Last</th><th>2-year zone</th><th>2-year vs avg</th><th>3-year zone</th><th>3-year vs avg</th>
         </tr>
       </thead>
       <tbody>
-        <tr class="down fresh"><td class="symbol">USAR <span class="new">New</span></td><td class="num down">10.21</td><td class="num down">−22.8%</td><td class="num">15.5M</td><td class="num">$4.23B</td><td class="num">18.09%</td><td class="num">8.7%</td><td><span class="zone">$9.79–$10.55</span></td><td class="num cyan">19.1%</td></tr>
-<tr class="down"><td class="symbol">IREN</td><td class="num down">30.50</td><td class="num down">−21.2%</td><td class="num">55.8M</td><td class="num">$13.71B</td><td class="num">23.65%</td><td class="num">8.7%</td><td><span class="zone">$29.52–$31.67</span></td><td class="num cyan">13.8%</td></tr>
+        <tr class=""><td class="symbol">AAOI</td><td class="symbol">AAOX</td><td class="num down">−4.56%</td><td class="num down">−22.3%</td><td class="num">9.3M</td><td class="num">13.1M</td><td class="num">$7.32B</td><td class="num">17.22%</td><td class="num">10.6%</td><td>Both</td><td class="num">82.28</td><td><span class="zone">$54.35–$79.01</span></td><td class="num cyan">38.0%</td><td><span class="zone">$49.79–$79.30</span></td><td class="num cyan">34.2%</td></tr>
+<tr class=""><td class="symbol">CIFR</td><td class="symbol">CIFU</td><td class="num up">+0.25%</td><td class="num down">−26.2%</td><td class="num">32.6M</td><td class="num">57.4M</td><td class="num">$4.13B</td><td class="num">21.81%</td><td class="num">9.6%</td><td>Both</td><td class="num">9.96</td><td><span class="zone">$8.81–$9.09</span></td><td class="num cyan">27.8%</td><td><span class="zone">$9.66–$9.95</span></td><td class="num cyan">24.2%</td></tr>
       </tbody>
     </table>
-    <p class="note">Polygon adjusted daily bars. Leveraged ETFs are excluded. Volume is today's share volume. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. Week is the last close versus five sessions earlier. Market cap has to be above $2 billion. Short float is from Finviz. A blue zone is under 20% of the average bar. Names within 15% of the two-year low are left out. All four screens refresh every 15 minutes from 9:30 AM to 4:15 PM ET on weekdays.</p>
+    </section>
+    <section class="panel">
+    <h2>HIT THE ZONE <span>5</span></h2>
+    <table class="zone-log">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>2x ETF</th><th>Hit</th><th>Last</th><th>Day</th><th>Week</th><th>Timeframe</th><th>2-year zone</th><th>2-year vs avg</th><th>3-year zone</th><th>3-year vs avg</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="symbol">DELL</td><td class="symbol">DLLL</td><td>3:00 AM CT</td><td class="num">492.73</td><td class="num down">−2.99%</td><td class="num down">−14.2%</td><td>3 year</td><td class="num">—</td><td class="num">—</td><td><span class="zone">$475.93–$529.44</span></td><td class="num cyan">35.7%</td></tr>
+<tr><td class="symbol">CRWV</td><td class="symbol">CRWG</td><td>8:53 AM CT</td><td class="num">59.78</td><td class="num down">−9.12%</td><td class="num down">−26.7%</td><td>Both</td><td><span class="zone">$55.21–$59.86</span></td><td class="num cyan">13.2%</td><td><span class="zone">$55.21–$59.86</span></td><td class="num cyan">13.2%</td></tr>
+<tr><td class="symbol">CIFR</td><td class="symbol">CIFU</td><td>9:40 AM CT</td><td class="num">8.96</td><td class="num down">−9.81%</td><td class="num down">−33.6%</td><td>Both</td><td><span class="zone">$8.81–$9.09</span></td><td class="num cyan">12.7%</td><td><span class="zone">$8.81–$9.38</span></td><td class="num cyan">11.0%</td></tr>
+<tr><td class="symbol">APLD</td><td class="symbol">APLX</td><td>9:40 AM CT</td><td class="num">18.63</td><td class="num down">−8.34%</td><td class="num down">−21.9%</td><td>Both</td><td><span class="zone">$17.53–$18.96</span></td><td class="num cyan">12.8%</td><td><span class="zone">$17.35–$19.28</span></td><td class="num cyan">9.2%</td></tr>
+<tr><td class="symbol">AAOI</td><td class="symbol">AAOX</td><td>9:47 AM CT</td><td class="num">78.70</td><td class="num down">−8.72%</td><td class="num down">−25.7%</td><td>Both</td><td><span class="zone">$54.35–$79.01</span></td><td class="num cyan">16.1%</td><td><span class="zone">$49.79–$79.30</span></td><td class="num cyan">14.8%</td></tr>
+      </tbody>
+    </table>
+    <p class="note">The first time each name's price traded inside its two-year or three-year zone today. It stays here after the price leaves.</p>
+    </section>
   </main>
-  <script>setInterval(() => location.reload(), 60000);</script>
+  <script>
+    const hiddenKey = "dashboard-hidden-rows";
+    function readHidden() {
+      try {
+        const data = JSON.parse(localStorage.getItem(hiddenKey) || "{}");
+        return data && typeof data === "object" ? data : {};
+      } catch (error) {
+        return {};
+      }
+    }
+    function writeHidden(data) {
+      localStorage.setItem(hiddenKey, JSON.stringify(data));
+    }
+    function screenName(section) {
+      const copy = section.querySelector("h2").cloneNode(true);
+      copy.querySelectorAll("span, button").forEach((node) => node.remove());
+      return copy.textContent.trim();
+    }
+    function tickerOf(row) {
+      const cell = row.querySelector(".symbol");
+      if (!cell) return "";
+      const copy = cell.cloneNode(true);
+      copy.querySelectorAll(".new, .hide").forEach((node) => node.remove());
+      return copy.textContent.trim();
+    }
+    function paint() {
+      const hidden = readHidden();
+      document.querySelectorAll("section.panel").forEach((section) => {
+        const name = screenName(section);
+        const gone = new Set(hidden[name] || []);
+        let count = 0;
+        section.querySelectorAll("tbody tr").forEach((row) => {
+          const ticker = tickerOf(row);
+          if (!ticker) return;
+          let button = row.querySelector(".hide");
+          if (!button) {
+            button = document.createElement("button");
+            button.type = "button";
+            button.className = "hide";
+            button.textContent = "×";
+            row.querySelector(".symbol").appendChild(button);
+          }
+          button.setAttribute("aria-label", "Hide " + ticker);
+          const isHidden = gone.has(ticker);
+          row.classList.toggle("hidden", isHidden);
+          if (isHidden) count += 1;
+        });
+        let restore = section.querySelector(".show-hidden");
+        if (!restore) {
+          restore = document.createElement("button");
+          restore.type = "button";
+          restore.className = "show-hidden";
+          section.querySelector("h2").appendChild(restore);
+        }
+        restore.hidden = count === 0;
+        restore.textContent = count === 1 ? "Show 1 hidden" : "Show " + count + " hidden";
+      });
+    }
+    document.addEventListener("click", (event) => {
+      const hide = event.target.closest(".hide");
+      if (hide) {
+        const section = hide.closest("section.panel");
+        const name = screenName(section);
+        const ticker = tickerOf(hide.closest("tr"));
+        const hidden = readHidden();
+        const list = new Set(hidden[name] || []);
+        list.add(ticker);
+        hidden[name] = Array.from(list);
+        writeHidden(hidden);
+        paint();
+        return;
+      }
+      const restore = event.target.closest(".show-hidden");
+      if (!restore) return;
+      const hidden = readHidden();
+      delete hidden[screenName(restore.closest("section.panel"))];
+      writeHidden(hidden);
+      paint();
+    });
+    paint();
+    setInterval(() => location.reload(), 60000);
+  </script>
 </body>
 </html>
