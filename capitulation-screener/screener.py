@@ -5,15 +5,18 @@ First pass: over the last 20 sessions, average daily volume at least 5
 million shares, and over the last year, average daily range at least 5%.
 Range is that day's high-to-low as a percent of that day's close.
 
-Then: the latest close is at least 20% below the close five sessions ago.
-Leveraged ETFs are left out. Those names are checked against a volume profile built from the prior two
-years, excluding that same week, so the profile is volume traded before the
-decline. Each day's shares are spread evenly from that day's low to high.
-A blue zone is a price area inside that range whose bars are shorter than
-20% of the average bar. The latest close has to sit in one, or within
-four bars of one, on the two-year profile or the three-year profile.
-It also has to be more than 15% above the lowest price of the last two
-years, and the market cap has to be above $2 billion.
+Then: price is at least 19% below the close five sessions ago. That percent
+is taken at the first print that traded inside a blue zone, not at the
+day's close. Leveraged ETFs are left out. Those names are checked against
+a volume profile built from the prior two years, excluding that same week,
+so the profile is volume traded before the decline. Each day's shares are
+spread evenly from that day's low to high. A blue zone is a price area
+inside that range whose bars are shorter than 30% of the median bar. The
+close also passes when it sits in one, or within four bars of one, on the
+two-year profile or the three-year profile. A name passes when price
+traded inside a blue zone from 4:00 a.m. to 8:00 p.m. Eastern while down
+at least 19%. It also has to be more than 25% above the lowest price of
+the last two years, and the market cap has to be above $2 billion.
 """
 
 import argparse
@@ -34,17 +37,19 @@ MIN_AVERAGE_RANGE = 5.0
 RANGE_YEAR = timedelta(days=365)
 RANGE_CACHE = Path(__file__).resolve().parent / "range-cache.json"
 RANGE_WORKERS = 8
-MIN_WEEK_DECLINE = 20.0
+MIN_WEEK_DECLINE = 19.0
 MIN_VOLUME_SESSIONS = 10
 SESSION_GOAL = 20
 WEEK_SESSIONS = 5
-THIN_OF_AVERAGE = 0.20
+THIN_OF_AVERAGE = 0.30
 NEAR_THIN_BARS = 4
-ABOVE_TWO_YEAR_LOW = 0.15
+ABOVE_TWO_YEAR_LOW = 0.25
 MIN_MARKET_CAP = 2_000_000_000
 BIN_COUNT = 100
 PROFILE_YEARS = 2
 PROFILE_YEARS_LONG = 3
+breach_context: dict[str, dict] = {}
+traded_inside: set[str] = set()
 KEY_FILE = Path.home() / ".config" / "two-day-screener" / "env"
 EASTERN = ZoneInfo("America/New_York")
 GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{day}"
@@ -479,20 +484,13 @@ def series_holds(bars: list[Bar]) -> bool:
     return True
 
 
-def blue_zone(bars: list[Bar], price: float) -> tuple[str, float] | None:
-    """Zone label and the close bar versus the average.
-
-    The close passes when its own bar is under 20% of the average, or when a
-    bar that thin sits within four bars of it. The percent is always the
-    close's own bar.
-    """
+def volume_profile(bars: list[Bar]) -> tuple[float, float, float, list[float]] | None:
+    """Profile low, bin width, average bar, and the 100 bin volumes."""
     if len(bars) < MIN_VOLUME_SESSIONS or not series_holds(bars):
         return None
     low = min(bar[3] for bar in bars)
     high = max(bar[2] for bar in bars)
-    if low <= 0 or high < low:
-        return None
-    if high == low:
+    if low <= 0 or high <= low:
         return None
     width = (high - low) / BIN_COUNT
     volumes = [0.0] * BIN_COUNT
@@ -513,24 +511,290 @@ def blue_zone(bars: list[Bar], price: float) -> tuple[str, float] | None:
     average = sum(volumes) / len(volumes)
     if average <= 0:
         return None
-    cutoff = average * THIN_OF_AVERAGE
-    if price < low or price > high:
-        return None
-    index = min(BIN_COUNT - 1, max(0, int((price - low) / width)))
-    nearby = range(max(0, index - NEAR_THIN_BARS), min(BIN_COUNT, index + NEAR_THIN_BARS + 1))
-    thin = [bar for bar in nearby if volumes[bar] < cutoff]
-    if not thin:
-        return None
-    anchor = min(thin, key=lambda bar: (abs(bar - index), bar))
+    return low, width, average, volumes
+
+
+def bar_median(volumes: list[float]) -> float:
+    """Median length of the profile bars, including the empty ones."""
+    ordered = sorted(volumes)
+    count = len(ordered)
+    if count == 0:
+        return 0.0
+    mid = count // 2
+    if count % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def thin_cutoff(volumes: list[float]) -> float:
+    """A blue zone is shorter than 30% of the median bar."""
+    return bar_median(volumes) * THIN_OF_AVERAGE
+
+
+def zone_label(low: float, width: float, volumes: list[float], cutoff: float, anchor: int) -> str:
     start = anchor
     while start > 0 and volumes[start - 1] < cutoff:
         start -= 1
     stop = anchor
     while stop + 1 < BIN_COUNT and volumes[stop + 1] < cutoff:
         stop += 1
-    zone_low = low + start * width
-    zone_high = low + (stop + 1) * width
-    return f"${zone_low:.2f}–${zone_high:.2f}", volumes[index] / average * 100
+    return f"${low + start * width:.2f}–${low + (stop + 1) * width:.2f}"
+
+
+def close_percent(
+    low: float, width: float, average: float, volumes: list[float], price: float
+) -> float | None:
+    profile_high = low + width * BIN_COUNT
+    if price < low or price > profile_high:
+        return None
+    index = min(BIN_COUNT - 1, max(0, int((price - low) / width)))
+    return volumes[index] / average * 100
+
+
+def blue_zone(bars: list[Bar], price: float) -> tuple[str, float] | None:
+    """Zone label and the close bar versus the average.
+
+    The close passes when its own bar is under 30% of the median, or when a
+    bar that thin sits within four bars of it. The percent is always the
+    close's own bar against the mean.
+    """
+    built = volume_profile(bars)
+    if built is None:
+        return None
+    low, width, average, volumes = built
+    profile_high = low + width * BIN_COUNT
+    if price < low or price > profile_high:
+        return None
+    cutoff = thin_cutoff(volumes)
+    index = min(BIN_COUNT - 1, max(0, int((price - low) / width)))
+    nearby = range(max(0, index - NEAR_THIN_BARS), min(BIN_COUNT, index + NEAR_THIN_BARS + 1))
+    thin = [bar for bar in nearby if volumes[bar] < cutoff]
+    if not thin:
+        return None
+    anchor = min(thin, key=lambda bar: (abs(bar - index), bar))
+    percent = volumes[index] / average * 100
+    return zone_label(low, width, volumes, cutoff, anchor), percent
+
+
+def thin_spans(
+    low: float, width: float, _average: float, volumes: list[float]
+) -> list[tuple[float, float, int, int]]:
+    """Contiguous thin stretches as (low, high, first bin, last bin)."""
+    cutoff = thin_cutoff(volumes)
+    spans: list[tuple[float, float, int, int]] = []
+    index = 0
+    while index < BIN_COUNT:
+        if volumes[index] < cutoff:
+            start = index
+            while index + 1 < BIN_COUNT and volumes[index + 1] < cutoff:
+                index += 1
+            spans.append((low + start * width, low + (index + 1) * width, start, index))
+        index += 1
+    return spans
+
+
+def profile_spans(
+    bars: list[Bar],
+) -> tuple[float, float, float, list[float], list[tuple[float, float, int, int]]] | None:
+    """Profile low, bin width, average, bin volumes, and the thin spans."""
+    built = volume_profile(bars)
+    if built is None:
+        return None
+    low, width, average, volumes = built
+    return low, width, average, volumes, thin_spans(low, width, average, volumes)
+
+
+def price_in_spans(price: float, spans: list[tuple[float, float, int, int]]) -> bool:
+    return any(zone_low <= price <= zone_high for zone_low, zone_high, _start, _stop in spans)
+
+
+def minute_zone_price(
+    high: float, low: float, close: float, spans: list[tuple[float, float, int, int]]
+) -> float | None:
+    """A price from this minute that traded inside a thin span."""
+    if not spans:
+        return None
+    if price_in_spans(close, spans):
+        return close
+    if price_in_spans(low, spans):
+        return low
+    if price_in_spans(high, spans):
+        return high
+    crossed = [
+        span for span in spans
+        if low <= span[1] and high >= span[0]
+    ]
+    if not crossed:
+        return None
+
+    def edge(span: tuple[float, float, int, int]) -> float:
+        if close >= span[1]:
+            return span[1]
+        if close <= span[0]:
+            return span[0]
+        return close
+
+    return min((edge(span) for span in crossed), key=lambda probe: abs(probe - close))
+
+
+def session_prints(api_key: str, symbol: str, day: date) -> list[tuple[datetime, float, float, float]]:
+    """Each 4:00 a.m. to 8:00 p.m. Eastern minute, as (time, high, low, close)."""
+    start = datetime(day.year, day.month, day.day, 4, 0, tzinfo=EASTERN)
+    finish = datetime(day.year, day.month, day.day, 20, 0, tzinfo=EASTERN)
+    url = (
+        "https://api.polygon.io/v2/aggs/ticker/"
+        f"{symbol}/range/1/minute/{int(start.timestamp() * 1000)}/{int(finish.timestamp() * 1000)}"
+    )
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key}
+    prints: list[tuple[datetime, float, float, float]] = []
+    while url:
+        body = None
+        for attempt in range(5):
+            response = requests.get(url, params=params, timeout=90)
+            if response.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if response.status_code != 200:
+                message = str(body.get("message") or body.get("error") or response.status_code)
+                raise RuntimeError(f"{symbol}: {message}")
+            break
+        else:
+            raise RuntimeError(f"{symbol}: rate limit while fetching the session")
+        for row in (body or {}).get("results") or []:
+            stamp, high, low, close = row.get("t"), row.get("h"), row.get("l"), row.get("c")
+            if None in (stamp, high, low, close):
+                continue
+            when = datetime.fromtimestamp(float(stamp) / 1000, EASTERN)
+            minute = when.hour * 60 + when.minute
+            if when.date() != day or not (EXTENDED_START_MINUTE <= minute < EXTENDED_END_MINUTE):
+                continue
+            prints.append((when, float(high), float(low), float(close)))
+        url = (body or {}).get("next_url")
+        params = None
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return prints
+
+
+def traded_in_zone(
+    prints: list[tuple[datetime, float, float, float]],
+    profiles: list[tuple[str, tuple]],
+    price: float,
+) -> bool:
+    """True when a session print, or the latest price, sat inside a thin span."""
+    union = [span for _name, profile in profiles for span in profile[4]]
+    if price_in_spans(price, union):
+        return True
+    return any(
+        minute_zone_price(high, low, close, union) is not None
+        for _when, high, low, close in prints
+    )
+
+
+def qualifying_breach(
+    prints: list[tuple[datetime, float, float, float]],
+    profiles: list[tuple[str, tuple]],
+    week_base: float,
+) -> tuple[datetime, float, list[str]] | None:
+    """First in-zone print that is already down 19% from the week-ago close."""
+    if week_base <= 0 or not profiles:
+        return None
+    for when, high, low, close in prints:
+        union = [span for _name, profile in profiles for span in profile[4]]
+        price = minute_zone_price(high, low, close, union)
+        if price is None:
+            continue
+        if (price - week_base) / week_base * 100 > -MIN_WEEK_DECLINE:
+            continue
+        hit = [name for name, profile in profiles if price_in_spans(price, profile[4])]
+        if not hit:
+            continue
+        return when, price, hit
+    return None
+
+
+def session_ranges(api_key: str, symbol: str, day: date) -> list[tuple[float, float]]:
+    """Each 4:00 a.m. to 8:00 p.m. Eastern minute, as (high, low)."""
+    start = datetime(day.year, day.month, day.day, 4, 0, tzinfo=EASTERN)
+    finish = datetime(day.year, day.month, day.day, 20, 0, tzinfo=EASTERN)
+    url = (
+        "https://api.polygon.io/v2/aggs/ticker/"
+        f"{symbol}/range/1/minute/{int(start.timestamp() * 1000)}/{int(finish.timestamp() * 1000)}"
+    )
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key}
+    ranges: list[tuple[float, float]] = []
+    while url:
+        body = None
+        for attempt in range(5):
+            response = requests.get(url, params=params, timeout=90)
+            if response.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if response.status_code != 200:
+                message = str(body.get("message") or body.get("error") or response.status_code)
+                raise RuntimeError(f"{symbol}: {message}")
+            break
+        else:
+            raise RuntimeError(f"{symbol}: rate limit while fetching the session")
+        for row in (body or {}).get("results") or []:
+            stamp, high, low = row.get("t"), row.get("h"), row.get("l")
+            if None in (stamp, high, low):
+                continue
+            when = datetime.fromtimestamp(float(stamp) / 1000, EASTERN)
+            minute = when.hour * 60 + when.minute
+            if when.date() != day or not (EXTENDED_START_MINUTE <= minute < EXTENDED_END_MINUTE):
+                continue
+            ranges.append((float(high), float(low)))
+        url = (body or {}).get("next_url")
+        params = None
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return ranges
+
+
+def touched_zone(
+    bars: list[Bar], price: float, prints: list[tuple[float, float]]
+) -> tuple[str, float | None] | None:
+    """Zone the session traded through, and the close bar versus the average."""
+    if not prints:
+        return None
+    built = volume_profile(bars)
+    if built is None:
+        return None
+    low, width, average, volumes = built
+    spans = thin_spans(low, width, average, volumes)
+    touched = [
+        span for span in spans
+        if any(bar_low <= span[1] and bar_high >= span[0] for bar_high, bar_low in prints)
+    ]
+    if not touched:
+        return None
+    profile_high = low + width * BIN_COUNT
+    if price < low:
+        index = -1
+    elif price > profile_high:
+        index = BIN_COUNT
+    else:
+        index = min(BIN_COUNT - 1, max(0, int((price - low) / width)))
+
+    def distance(span: tuple[float, float, int, int]) -> tuple[int, int]:
+        start, stop = span[2], span[3]
+        if start <= index <= stop:
+            return 0, start
+        if index < start:
+            return start - index, start
+        return index - stop, start
+
+    zone_low, zone_high, _start, _stop = min(touched, key=distance)
+    return f"${zone_low:.2f}–${zone_high:.2f}", close_percent(low, width, average, volumes, price)
 
 
 def first_pass(
@@ -563,7 +827,9 @@ def first_pass(
         if price <= 0 or base_close <= 0:
             continue
         change = (price - base_close) / base_close * 100
-        if change > -MIN_WEEK_DECLINE:
+        session_low = current[3]
+        low_change = (session_low - base_close) / base_close * 100 if session_low > 0 else change
+        if change > -MIN_WEEK_DECLINE and low_change > -MIN_WEEK_DECLINE:
             continue
         rows.append((symbol, price, change, average_volume, average_range, current[1]))
     rows.sort(key=lambda row: row[2])
@@ -610,6 +876,9 @@ def find_matches(
     profile_end = sessions[WEEK_SESSIONS][0]
     start_two = profile_end - timedelta(days=365 * PROFILE_YEARS)
     start_three = profile_end - timedelta(days=365 * PROFILE_YEARS_LONG)
+    week_bases = sessions[WEEK_SESSIONS][1]
+    breach_context.clear()
+    traded_inside.clear()
     matches = []
     for symbol, price, change, average_volume, average_range, session_volume in candidates:
         cap = market_cap(api_key, symbol, price)
@@ -623,13 +892,63 @@ def find_matches(
             dated, today_low = adjust_bars(symbol, dated)
         bars_two = [bar for day, bar in dated if day >= start_two]
         bars_three = [bar for _day, bar in dated]
-        zone_two = blue_zone(bars_two, price) if bars_two else None
-        zone_three = blue_zone(bars_three, price) if bars_three else None
-        if zone_two is None and zone_three is None:
-            log(f"{symbol}: down {change:.1f}%, not in a blue zone on either profile")
-            continue
         if not bars_two:
             log(f"{symbol}: down {change:.1f}%, no two-year profile")
+            continue
+        two_profile = profile_spans(bars_two)
+        three_profile = profile_spans(bars_three) if bars_three else None
+        profiles = []
+        if two_profile is not None:
+            profiles.append(("2 year", two_profile))
+        if three_profile is not None:
+            profiles.append(("3 year", three_profile))
+        week_bar = week_bases.get(symbol)
+        week_base = week_bar[0] if week_bar is not None else 0.0
+        prior = sessions[1][1].get(symbol)
+        prior_close = prior[0] if prior is not None and prior[0] > 0 else 0.0
+        breach = None
+        prints: list[tuple[datetime, float, float, float]] = []
+        if week_base > 0 and profiles:
+            try:
+                prints = session_prints(api_key, symbol, sessions[0][0])
+            except Exception as error:
+                log(f"{symbol}: zone touch scan failed ({error})")
+                prints = []
+            breach = qualifying_breach(prints, profiles, week_base)
+        setup_price = price
+        zone_two = None
+        zone_three = None
+        if breach is not None:
+            _when, setup_price, hit_names = breach
+            change = (setup_price - week_base) / week_base * 100
+            for name, profile in profiles:
+                if name not in hit_names:
+                    continue
+                low, width, average, volumes, spans = profile
+                containing = [span for span in spans if span[0] <= setup_price <= span[1]]
+                if not containing:
+                    continue
+                span = containing[0]
+                label = f"${span[0]:.2f}–${span[1]:.2f}"
+                versus = close_percent(low, width, average, volumes, setup_price)
+                if name == "2 year":
+                    zone_two = (label, versus)
+                else:
+                    zone_three = (label, versus)
+            breach_context[symbol] = {
+                "prior": prior_close,
+                "week_base": week_base,
+                "when": breach[0],
+                "price": setup_price,
+            }
+        else:
+            if change > -MIN_WEEK_DECLINE:
+                log(f"{symbol}: low was down 19%, close is only down {change:.1f}% and it never breached a zone that far")
+                continue
+            zone_two = blue_zone(bars_two, price) if bars_two else None
+            zone_three = blue_zone(bars_three, price) if bars_three else None
+        if zone_two is None and zone_three is None:
+            log(f"{symbol}: down {change:.1f}%, did not trade a blue zone on either profile")
             continue
         two_year_low = min(bar[3] for bar in bars_two)
         latest = sessions[0][1].get(symbol)
@@ -637,8 +956,8 @@ def find_matches(
             two_year_low = min(two_year_low, latest[3])
         if today_low is not None:
             two_year_low = min(two_year_low, today_low)
-        if price <= two_year_low * (1 + ABOVE_TWO_YEAR_LOW):
-            log(f"{symbol}: down {change:.1f}%, within 15% of the two-year low ${two_year_low:.2f}")
+        if setup_price <= two_year_low * (1 + ABOVE_TWO_YEAR_LOW):
+            log(f"{symbol}: down {change:.1f}%, within 25% of the two-year low ${two_year_low:.2f}")
             continue
         if zone_two and zone_three:
             timeframe = "Both"
@@ -646,9 +965,10 @@ def find_matches(
             timeframe = "2 year"
         else:
             timeframe = "3 year"
-        above_low = (price / two_year_low - 1) * 100
-        prior = sessions[1][1].get(symbol)
-        day_change = (price / prior[0] - 1) * 100 if prior is not None and prior[0] > 0 else None
+        above_low = (setup_price / two_year_low - 1) * 100
+        day_change = (setup_price / prior_close - 1) * 100 if prior_close > 0 else None
+        if traded_in_zone(prints, profiles, price) or traded_in_zone(prints, profiles, setup_price):
+            traded_inside.add(symbol)
         log(f"{symbol}: {timeframe}")
         matches.append((
             symbol, price, change, average_volume, average_range,
@@ -881,7 +1201,7 @@ def run_screen(
     log(
         f"{screen_day.isoformat()} vs {base_day.isoformat()}: "
         f"{liquid} names average 5M shares and a 5% range over the last year, "
-        f"{len(candidates)} are down 20% on the week"
+        f"{len(candidates)} are down 19% on the week at the close or the low"
     )
     matches = find_matches(api_key, sessions, candidates, adjust_bars)
     return screen_day, base_day, matches, liquid, len(candidates)
@@ -898,9 +1218,9 @@ def main() -> None:
     screen_day, _base_day, matches, liquid, declined = run_screen(as_of)
     if not matches:
         print(
-            f"No names on {screen_day.isoformat()} are down 20% over the last week "
+            f"No names on {screen_day.isoformat()} are down 19% over the last week "
             f"and trading in a thin volume zone above a $2 billion market cap. {liquid} names average at least 5M shares "
-            f"and a 5% daily range over the last year; {declined} of those are down 20% on the week."
+            f"and a 5% daily range over the last year; {declined} of those are down 19% on the week."
         )
         return
     print_table(screen_day, matches)

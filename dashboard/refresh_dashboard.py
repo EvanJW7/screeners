@@ -30,6 +30,7 @@ DASHBOARD = CANVAS_DIR / "capitulation-screen.canvas.tsx"
 PAGE = Path(__file__).resolve().parent / "dashboard.html"
 PRIOR_PATH = PAGE.with_name("dashboard-prior.json")
 ZONE_HITS_PATH = PAGE.with_name("dashboard-zone-hits.json")
+KEPT_PATH = PAGE.with_name("dashboard-kept-rows.json")
 ETFIQ = Path(
     "/Users/evanwright/.cursor/projects/Users-evanwright-Cursor-screeners-volume-profile-screener"
     "/agent-tools/1feacf93-979a-4b8f-908b-b1186d73296b.txt"
@@ -289,6 +290,49 @@ def fetch_dated(api_key: str, symbol: str, start: date, end: date) -> list[tuple
     raise RuntimeError(f"Polygon rate limit while fetching {symbol}")
 
 
+def qqq_from_high(api_key: str, as_of: date, quotes: dict | None) -> str:
+    """How far QQQ's last price sits under its highest daily high."""
+    try:
+        bars = fetch_dated(api_key, "QQQ", date(1999, 3, 10), as_of)
+    except Exception as error:
+        s.log(f"QQQ high failed: {error}")
+        return ""
+    if not bars:
+        return ""
+    peak = max(bar[2] for bar in bars)
+    price = bars[-1][4]
+    live = (quotes or {}).get("QQQ") or {}
+    if live.get("price"):
+        price = float(live["price"])
+    try:
+        response = s.requests.get(
+            "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/QQQ",
+            params={"apiKey": api_key},
+            timeout=30,
+        )
+        if response.status_code == 200:
+            ticker = response.json().get("ticker") or {}
+            day = ticker.get("day") or {}
+            minute = ticker.get("min") or {}
+            if day.get("h"):
+                peak = max(peak, float(day["h"]))
+            last = minute.get("c") or day.get("c")
+            if last:
+                price = float(last)
+    except Exception as error:
+        s.log(f"QQQ quote failed: {error}")
+    peak = max(peak, price)
+    if peak <= 0:
+        return ""
+    change = (price / peak - 1.0) * 100
+    if change > -0.05:
+        return '<span class="qqq-high up" title="QQQ last price versus its highest daily high">QQQ at its high</span>'
+    return (
+        '<span class="qqq-high down" title="QQQ last price versus its highest daily high">'
+        f"QQQ −{abs(change):.1f}% from high</span>"
+    )
+
+
 def profile_bins(bars: list[s.Bar]) -> tuple[float, float, list[float]] | None:
     if len(bars) < s.MIN_VOLUME_SESSIONS or not s.series_holds(bars):
         return None
@@ -316,8 +360,7 @@ def profile_bins(bars: list[s.Bar]) -> tuple[float, float, list[float]] | None:
 
 
 def labeled_zones(low: float, width: float, volumes: list[float], price: float) -> list[tuple[float, float]]:
-    average = sum(volumes) / len(volumes)
-    cutoff = average * s.THIN_OF_AVERAGE
+    cutoff = s.thin_cutoff(volumes)
     spans: list[tuple[int, int]] = []
     start = None
     for index, volume in enumerate(volumes):
@@ -372,9 +415,25 @@ def component_name(symbol: str) -> str:
     return f"{stem}VolumeProfile"
 
 
+def chart_slug(symbol: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", symbol.lower()).strip("-")
+
+
 def chart_path(symbol: str) -> Path:
-    slug = re.sub(r"[^a-z0-9]+", "-", symbol.lower()).strip("-")
-    return CANVAS_DIR / f"{slug}-volume-profile.canvas.tsx"
+    return CANVAS_DIR / f"{chart_slug(symbol)}-volume-profile.canvas.tsx"
+
+
+def chart_page_path(symbol: str) -> Path:
+    return PAGE.parent / "charts" / f"{chart_slug(symbol)}.html"
+
+
+def chart_anchor(symbol: str) -> str:
+    """Ticker link when that name's volume-profile page is already written."""
+    page = chart_page_path(symbol)
+    label = html.escape(symbol)
+    if not page.exists():
+        return label
+    return f'<a class="chart-link" href="charts/{page.name}">{label}</a>'
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -448,13 +507,13 @@ const PRICE_MAX = {js_num(price_max)};
 const TICKS = [{ticks_js}];
 const DATE_TICKS = [{dates_js}];
 
-const WIDTH = 920;
+const WIDTH = 1120;
 const HEIGHT = 520;
 const LEFT = 58;
 const TOP = 18;
 const PRICE_W = 640;
 const GAP = 18;
-const PROFILE_W = 168;
+const PROFILE_W = 280;
 const VOL_H = 72;
 const BOTTOM = 32;
 
@@ -466,7 +525,12 @@ export default function {name}() {{
   const n = BARS.length;
   const maxVol = Math.max(...BARS.map((bar) => bar[5]));
   const maxProfile = Math.max(...PROFILE.map((bin) => bin[1]));
-  const averageBar = PROFILE.reduce((sum, bin) => sum + bin[1], 0) / 100;
+  const lengths = PROFILE.map((bin) => bin[1]).sort((a, b) => a - b);
+  const mid = Math.floor(lengths.length / 2);
+  const medianBar = lengths.length % 2 ? lengths[mid] : (lengths[mid - 1] + lengths[mid]) / 2;
+  const longCutoff = lengths[Math.floor(lengths.length * 0.75)];
+  const currentPrice = BARS[n - 1][4];
+  const firstRed = PROFILE.find(([price, volume]) => volume >= longCutoff && price > currentPrice);
   const yOf = (price: number) => TOP + ((PRICE_MAX - price) / (PRICE_MAX - PRICE_MIN)) * plotH;
   const xOf = (index: number) => LEFT + (index / (n - 1)) * PRICE_W;
   const closePath = BARS.map((bar, index) => `${{index === 0 ? "M" : "L"}}${{xOf(index).toFixed(1)}},${{yOf(bar[4]).toFixed(1)}}`).join("");
@@ -501,7 +565,7 @@ export default function {name}() {{
       <Stack gap={{6}}>
         <H1>{symbol} blue zone</H1>
         <Text tone="secondary">
-          {title} from {{BARS[0][0]}} through {session_note}. Highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. The volume profile is the {"three" if years == 3 else "two"} years through {profile_label}, before this week's decline. A blue zone is a bar shorter than 20% of the average bar. The close passes when it sits in one, or within 4 bars of one, on the two-year or three-year profile.
+          {title} from {{BARS[0][0]}} through {session_note}. Highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. The volume profile is the {"three" if years == 3 else "two"} years through {profile_label}, before this week's decline. A blue zone is a bar shorter than 30% of the median bar. The close passes when it sits in one, or within 4 bars of one, on the two-year or three-year profile. A name also passes when price trades inside a blue zone from 4:00 a.m. to 8:00 p.m. Eastern. The week drop is measured at that breach, not at the close.
         </Text>
       </Stack>
       <Row gap={{24}} align="end">
@@ -517,14 +581,21 @@ export default function {name}() {{
             <text x={{LEFT - 8}} y={{yOf(price) + 4}} textAnchor="end" fill={{theme.text.tertiary}} fontSize={{11}}>{{price < 10 ? price.toFixed(2) : price.toFixed(0)}}</text>
           </g>
         ))}}
+        {{ZONES.map(([zoneLow, zoneHigh]) => (
+          <rect key={{`band-${{zoneLow}}`}} x={{LEFT}} y={{yOf(zoneHigh)}} width={{PRICE_W}} height={{Math.max(1, yOf(zoneLow) - yOf(zoneHigh))}} fill={{theme.chart.sequence[1]}} opacity={{0.18}} />
+        ))}}
         <path d={{band}} fill={{theme.fill.tertiary}} />
         <path d={{closePath}} fill="none" stroke={{theme.accent.primary}} strokeWidth={{1.6}} />
+        {{firstRed ? (
+          <text x={{profileX + PROFILE_W + 6}} y={{(yOf(firstRed[0]) + yOf(firstRed[0] + BIN)) / 2 + 4}} fill={{theme.category.red}} fontSize={{11}}>{{`$${{firstRed[0].toFixed(2)}}`}}</text>
+        ) : null}}
         {{PROFILE.map(([price, volume]) => {{
-          const thin = volume < averageBar * {s.THIN_OF_AVERAGE};
+          const thin = volume < medianBar * {s.THIN_OF_AVERAGE};
+          const heavy = volume >= longCutoff;
           const top = yOf(price + BIN);
           const barHeight = Math.max(1, yOf(price) - top - 0.2);
           const barWidth = (volume / maxProfile) * PROFILE_W;
-          return <rect key={{price}} x={{profileX}} y={{top}} width={{barWidth}} height={{barHeight}} fill={{thin ? theme.chart.sequence[1] : theme.fill.primary}} />;
+          return <rect key={{price}} x={{profileX}} y={{top}} width={{barWidth}} height={{barHeight}} fill={{thin ? theme.chart.sequence[1] : heavy ? theme.category.red : theme.fill.primary}} opacity={{heavy ? 0.55 : 1}} />;
         }})}}
         {{ZONES.map(([zoneLow, zoneHigh]) => (
           <text key={{zoneLow}} x={{profileX + 8}} y={{(yOf(zoneLow) + yOf(zoneHigh)) / 2}} fill={{theme.text.primary}} fontSize={{11}}>{{`$${{zoneLow.toFixed(2)}}–$${{zoneHigh.toFixed(2)}}`}}</text>
@@ -554,8 +625,8 @@ export default function {name}() {{
       </svg>
       <Row gap={{16}} align="center">
         <Text size="small" tone="secondary">Close</Text>
-        <Text size="small" tone="tertiary">4:00 a.m.–8:00 p.m. high and low</Text>
-        <Text size="small" tone="tertiary">Blue bars are under 20% of the average bar</Text>
+        <Text size="small" tone="tertiary">High to low</Text>
+        <Text size="small" tone="tertiary">Blue bars are under 30% of the median bar. Light red bars are the longest 25%.</Text>
       </Row>
       <Text size="small" tone="tertiary">
         Source: Polygon adjusted daily volume, with highs and lows from 4:00 a.m. to 8:00 p.m. Eastern. The profile stops on {profile_label}, so this week's selling is not part of the average. {screen_label}{" is still in progress." if in_progress else "."}
@@ -563,6 +634,296 @@ export default function {name}() {{
     </Stack>
   );
 }}
+'''
+
+
+def render_chart_html(
+    symbol: str,
+    company: str,
+    price_bars: list[tuple],
+    profile_end: date,
+    screen_day: date,
+    in_progress: bool,
+    years: int = 2,
+) -> str:
+    """A volume-profile page the dashboard window can open."""
+    profile_rows = [bar for bar in price_bars if bar[0] <= profile_end.isoformat()]
+    profile_input = [(bar[4], bar[5], bar[2], bar[3], bar[1]) for bar in profile_rows]
+    built = profile_bins(profile_input)
+    if built is None or not price_bars:
+        raise RuntimeError(f"{symbol}: no profile to chart")
+    low, width, volumes = built
+    high = low + width * s.BIN_COUNT
+    last_close = price_bars[-1][4]
+    zone = s.blue_zone(profile_input, last_close)
+    versus = zone[1] if zone else 0
+    zone_label = zone[0] if zone else "—"
+    span = high - low
+    price_min = 0 if low < span * 0.2 else low - span * 0.04
+    price_max = high + span * 0.04
+    ticks = [tick for tick in price_ticks(price_min, price_max) if price_min < tick < price_max]
+    count = len(price_bars)
+    tick_count = min(8, count)
+    date_indexes = sorted({round(i * (count - 1) / (tick_count - 1)) for i in range(tick_count)}) if count > 1 else [0]
+    date_ticks = [price_bars[index][0] for index in date_indexes]
+    title = company if company and company.upper() != symbol else symbol
+    screen_label = screen_day.strftime("%B %-d, %Y")
+    session_note = (
+        f"the delayed {screen_label} session, still in progress"
+        if in_progress
+        else f"the {screen_label} session"
+    )
+    profile_label = profile_end.strftime("%B %-d, %Y")
+    bars_js = ",".join(
+        f'["{bar[0]}",{js_num(bar[1])},{js_num(bar[2])},{js_num(bar[3])},{js_num(bar[4])},{js_num(bar[5])}]'
+        for bar in price_bars
+    )
+    profile_js = ",".join(
+        f"[{js_num(low + index * width)},{js_num(volume)}]" for index, volume in enumerate(volumes)
+    )
+    ticks_js = ",".join(js_num(tick) for tick in ticks)
+    dates_js = ",".join(f'"{day}"' for day in date_ticks)
+    chart_zones = labeled_zones(low, width, volumes, last_close)
+    zones_js = ",".join(
+        f"[{js_num(zone_low)},{js_num(zone_high)}]" for zone_low, zone_high in chart_zones
+    )
+    last_price = f"${last_close:.2f}"
+    versus_text = f"{versus:.0f}%"
+    years_word = "three" if years == 3 else "two"
+    screen_end = " is still in progress." if in_progress else "."
+    safe_symbol = html.escape(symbol)
+    safe_title = html.escape(title)
+    safe_zone = html.escape(zone_label)
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{safe_symbol} volume profile</title>
+  <style>
+    :root {{
+      --bg: #0c0f12;
+      --text: #e8eef2;
+      --muted: #8b98a5;
+      --cyan: #4cc3ff;
+      --line: #24303a;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{ max-width: 1120px; margin: 0 auto; padding: 28px 24px 48px; }}
+    a.back {{ color: var(--cyan); text-decoration: none; font-size: 14px; }}
+    a.back:hover {{ text-decoration: underline; }}
+    h1 {{ font-size: 28px; margin: 18px 0 8px; letter-spacing: 0.04em; }}
+    h2 {{ font-size: 16px; font-weight: 650; letter-spacing: 0.04em; margin: 26px 0 8px; }}
+    p {{ color: var(--muted); line-height: 1.5; font-size: 14px; }}
+    .stats {{ display: flex; gap: 28px; margin: 18px 0; }}
+    .stats b {{ display: block; color: var(--text); font-size: 20px; font-weight: 650; }}
+    .stats span {{ color: var(--muted); font-size: 12px; }}
+    .zone b {{ color: var(--cyan); }}
+    svg {{ width: 100%; height: auto; background: #10161c; border-radius: 8px; }}
+    .legend {{ display: flex; gap: 18px; font-size: 12px; }}
+    .swatch {{ display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; }}
+    .swatch.shade {{ height: 8px; background: rgba(139, 152, 165, 0.45); }}
+    .swatch.band {{ height: 10px; background: rgba(76, 195, 255, 0.28); border: 1px solid #4cc3ff; }}
+  </style>
+</head>
+<body>
+  <main>
+    <a class="back" href="../dashboard.html">← Dashboard</a>
+    <h1>{safe_symbol} blue zone</h1>
+    <p>{safe_title} from {html.escape(price_bars[0][0])} through {html.escape(session_note)}. Highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. The volume profile is the {years_word} years through {html.escape(profile_label)}, before this week's decline.</p>
+    <div class="stats">
+      <div><b>{last_price}</b><span>Last price</span></div>
+      <div><b>{versus_text}</b><span>That bar versus the average</span></div>
+      <div class="zone"><b>{safe_zone}</b><span>Blue zone at the last price</span></div>
+    </div>
+    <svg id="chart" viewBox="0 0 1120 520" role="img" aria-label="{safe_symbol} daily price with its volume profile"></svg>
+    <p class="legend"><span><i class="swatch" style="background:#d7e3ee"></i>Close</span><span><i class="swatch shade"></i>High to low</span><span><i class="swatch band"></i>Blue zone</span><span><i class="swatch" style="background:#FC6B83;opacity:0.55"></i>Longest 25%</span></p>
+    <h2>Last 15 sessions</h2>
+    <p>Each candle runs from that day's low to its high, 4:00 a.m. to 8:00 p.m. Eastern. A cyan wick is a day that traded inside a blue zone.</p>
+    <svg id="recent" viewBox="0 0 1120 300" role="img" aria-label="{safe_symbol} last 15 sessions"></svg>
+    <p>Source: Polygon adjusted daily volume, with highs and lows from 4:00 a.m. to 8:00 p.m. Eastern. The profile stops on {html.escape(profile_label)}, so this week's selling is not part of the average. {html.escape(screen_label)}{screen_end}</p>
+  </main>
+  <script>
+    const BARS = [{bars_js}];
+    const PROFILE = [{profile_js}];
+    const BIN = {js_num(width)};
+    const PRICE_MIN = {js_num(price_min)};
+    const PRICE_MAX = {js_num(price_max)};
+    const TICKS = [{ticks_js}];
+    const DATE_TICKS = [{dates_js}];
+    const SCREEN = "{screen_day.strftime("%b %-d")}";
+    const ZONES = [{zones_js}];
+    const WIDTH = 1120, HEIGHT = 520, LEFT = 58, TOP = 18, PRICE_W = 640, GAP = 18, PROFILE_W = 280, VOL_H = 72, BOTTOM = 32;
+    const svg = document.getElementById("chart");
+    const n = BARS.length;
+    const plotBottom = HEIGHT - BOTTOM - VOL_H - 10;
+    const plotH = plotBottom - TOP;
+    const maxVol = Math.max(...BARS.map((bar) => bar[5]));
+    const maxProfile = Math.max(...PROFILE.map((bin) => bin[1]));
+    const lengths = PROFILE.map((bin) => bin[1]).sort((a, b) => a - b);
+    const mid = Math.floor(lengths.length / 2);
+    const medianBar = lengths.length % 2 ? lengths[mid] : (lengths[mid - 1] + lengths[mid]) / 2;
+    const longCutoff = lengths[Math.floor(lengths.length * 0.75)];
+    const currentPrice = BARS[n - 1][4];
+    const firstRed = PROFILE.find(([price, volume]) => volume >= longCutoff && price > currentPrice);
+    const yOf = (price) => TOP + ((PRICE_MAX - price) / (PRICE_MAX - PRICE_MIN)) * plotH;
+    const xOf = (index) => LEFT + (index / (n - 1)) * PRICE_W;
+    const dateIndex = (day) => {{
+      let best = 0, bestGap = Infinity;
+      BARS.forEach((bar, index) => {{
+        const gap = Math.abs(Date.parse(bar[0]) - Date.parse(day));
+        if (gap < bestGap) {{ bestGap = gap; best = index; }}
+      }});
+      return best;
+    }};
+    function overlaps(high, low) {{
+      return ZONES.some(([zoneLow, zoneHigh]) => low <= zoneHigh && high >= zoneLow);
+    }}
+    function priceTicks(minPrice, maxPrice) {{
+      const span = maxPrice - minPrice;
+      if (!(span > 0)) return [minPrice];
+      const raw = span / 4;
+      const magnitude = 10 ** Math.floor(Math.log10(raw));
+      let chosen = 10 * magnitude;
+      for (const step of [1, 2, 2.5, 5, 10]) {{
+        if (step * magnitude >= raw * 0.75) {{
+          chosen = step * magnitude;
+          break;
+        }}
+      }}
+      const start = Math.ceil(minPrice / chosen) * chosen;
+      const ticks = [];
+      for (let value = start; value < maxPrice && ticks.length < 6; value += chosen) ticks.push(value);
+      return ticks.length ? ticks : [(minPrice + maxPrice) / 2];
+    }}
+    function zoneBands(yOfPrice, plotTop, plotBottomPrice) {{
+      return ZONES.map(([zoneLow, zoneHigh]) => {{
+        const y1 = Math.max(plotTop, yOfPrice(zoneHigh));
+        const y2 = Math.min(plotBottomPrice, yOfPrice(zoneLow));
+        if (y2 - y1 < 0.5) return "";
+        return `<rect x="${{LEFT}}" y="${{y1}}" width="${{PRICE_W}}" height="${{y2 - y1}}" fill="rgba(76,195,255,0.18)"/>`;
+      }}).join("");
+    }}
+    function draw(hover) {{
+      const closePath = BARS.map((bar, index) => `${{index === 0 ? "M" : "L"}}${{xOf(index).toFixed(1)}},${{yOf(bar[4]).toFixed(1)}}`).join("");
+      const forward = BARS.map((bar, index) => `${{index === 0 ? "M" : "L"}}${{xOf(index).toFixed(1)}},${{yOf(bar[2]).toFixed(1)}}`).join("");
+      const back = [...BARS].reverse().map((bar, index) => `L${{xOf(n - 1 - index).toFixed(1)}},${{yOf(bar[3]).toFixed(1)}}`).join("");
+      const grid = TICKS.map((price) => `<line x1="${{LEFT}}" x2="${{LEFT + PRICE_W}}" y1="${{yOf(price)}}" y2="${{yOf(price)}}" stroke="#24303a"/>
+        <text x="${{LEFT - 8}}" y="${{yOf(price) + 4}}" text-anchor="end" fill="#8b98a5" font-size="11">${{price < 10 ? price.toFixed(2) : price.toFixed(0)}}</text>`).join("");
+      const profileX = LEFT + PRICE_W + GAP;
+      const profile = PROFILE.map(([price, volume]) => {{
+        const thin = volume < medianBar * {s.THIN_OF_AVERAGE};
+        const heavy = volume >= longCutoff;
+        const top = yOf(price + BIN);
+        const barHeight = Math.max(1, yOf(price) - top - 0.2);
+        const barWidth = maxProfile > 0 ? (volume / maxProfile) * PROFILE_W : 0;
+        return `<rect x="${{profileX}}" y="${{top}}" width="${{barWidth}}" height="${{barHeight}}" fill="${{thin ? "#4cc3ff" : heavy ? "#FC6B83" : "#3d4f60"}}" fill-opacity="${{heavy ? 0.55 : 1}}"/>`;
+      }}).join("");
+      const slot = PRICE_W / n;
+      const volume = BARS.map((bar, index) => {{
+        const height = maxVol > 0 ? (bar[5] / maxVol) * (VOL_H - 14) : 0;
+        return `<rect x="${{xOf(index) - slot / 2}}" y="${{HEIGHT - BOTTOM - height}}" width="${{Math.max(0.6, slot * 0.7)}}" height="${{height}}" fill="${{hover === index ? "#d7e3ee" : "#31404c"}}"/>`;
+      }}).join("");
+      const dates = DATE_TICKS.map((day) => {{
+        const index = dateIndex(day);
+        const label = index === n - 1 ? SCREEN : day.slice(0, 7);
+        return `<text x="${{xOf(index)}}" y="${{HEIGHT - 8}}" text-anchor="middle" fill="#8b98a5" font-size="11">${{label}}</text>`;
+      }}).join("");
+      let tip = "";
+      if (hover !== null) {{
+        const bar = BARS[hover];
+        const x = Math.min(xOf(hover) + 8, LEFT + PRICE_W - 148);
+        tip = `<line x1="${{xOf(hover)}}" x2="${{xOf(hover)}}" y1="${{TOP}}" y2="${{plotBottom}}" stroke="#8b98a5"/>
+          <rect x="${{x}}" y="${{TOP + 8}}" width="140" height="78" fill="#141a20" stroke="#31404c"/>
+          <text x="${{x + 8}}" y="${{TOP + 26}}" fill="#e8eef2" font-size="12">${{bar[0]}}</text>
+          <text x="${{x + 8}}" y="${{TOP + 44}}" fill="#8b98a5" font-size="11">O ${{bar[1].toFixed(2)}}  C ${{bar[4].toFixed(2)}}</text>
+          <text x="${{x + 8}}" y="${{TOP + 60}}" fill="#8b98a5" font-size="11">H ${{bar[2].toFixed(2)}}  L ${{bar[3].toFixed(2)}}</text>
+          <text x="${{x + 8}}" y="${{TOP + 76}}" fill="#8b98a5" font-size="11">${{(bar[5] / 1e6).toFixed(1)}}M shares</text>`;
+      }}
+      svg.innerHTML = `<text x="${{LEFT}}" y="14" fill="#8b98a5" font-size="11">Price (USD)</text>${{grid}}${{zoneBands(yOf, TOP, plotBottom)}}
+        <path d="${{forward}} ${{back}} Z" fill="rgba(139,152,165,0.28)"/>
+        <path d="${{closePath}}" fill="none" stroke="#d7e3ee" stroke-width="1.6"/>
+        ${{firstRed ? `<text x="${{profileX + PROFILE_W + 6}}" y="${{(yOf(firstRed[0]) + yOf(firstRed[0] + BIN)) / 2 + 4}}" fill="#FC6B83" font-size="11">$${{firstRed[0].toFixed(2)}}</text>` : ""}}
+        <text x="${{profileX}}" y="14" fill="#8b98a5" font-size="11">Volume at price</text>${{profile}}${{volume}}
+        <text x="${{LEFT}}" y="${{HEIGHT - BOTTOM - VOL_H + 12}}" fill="#8b98a5" font-size="11">Daily volume (shares)</text>${{dates}}${{tip}}`;
+    }}
+    const recentSvg = document.getElementById("recent");
+    const RECENT_N = Math.min(15, n);
+    const recent = BARS.slice(n - RECENT_N);
+    const R_HEIGHT = 300, R_TOP = 16, R_BOTTOM = 36;
+    const recentBottom = R_HEIGHT - R_BOTTOM;
+    function drawRecent(hover) {{
+      const lo = Math.min(...recent.map((bar) => bar[3]));
+      const hi = Math.max(...recent.map((bar) => bar[2]));
+      const pad = Math.max((hi - lo) * 0.1, hi * 0.004);
+      const zMin = lo - pad;
+      const zMax = hi + pad;
+      const plotSpan = recentBottom - R_TOP;
+      const yR = (price) => R_TOP + ((zMax - price) / (zMax - zMin)) * plotSpan;
+      const slot = PRICE_W / RECENT_N;
+      const xR = (index) => LEFT + index * slot + slot / 2;
+      const grid = priceTicks(zMin, zMax).map((price) => `<line x1="${{LEFT}}" x2="${{LEFT + PRICE_W}}" y1="${{yR(price)}}" y2="${{yR(price)}}" stroke="#24303a"/>
+        <text x="${{LEFT - 8}}" y="${{yR(price) + 4}}" text-anchor="end" fill="#8b98a5" font-size="11">${{price < 10 ? price.toFixed(2) : price.toFixed(0)}}</text>`).join("");
+      const candles = recent.map((bar, index) => {{
+        const color = bar[4] >= bar[1] ? "#00b85c" : "#e23b3b";
+        const hit = overlaps(bar[2], bar[3]);
+        const bodyTop = Math.min(yR(bar[1]), yR(bar[4]));
+        const bodyH = Math.max(1.5, Math.abs(yR(bar[4]) - yR(bar[1])));
+        const bodyW = Math.max(4, slot * 0.52);
+        return `<line x1="${{xR(index)}}" x2="${{xR(index)}}" y1="${{yR(bar[2])}}" y2="${{yR(bar[3])}}" stroke="${{hit ? "#4cc3ff" : "#e8eef2"}}" stroke-width="${{hit ? 2.2 : 1.3}}"/>
+          <rect x="${{xR(index) - bodyW / 2}}" y="${{bodyTop}}" width="${{bodyW}}" height="${{bodyH}}" fill="${{color}}"/>`;
+      }}).join("");
+      const visible = PROFILE.filter(([price]) => price + BIN >= zMin && price <= zMax);
+      const localMax = Math.max(1, ...visible.map((bin) => bin[1]), 0);
+      const profileX = LEFT + PRICE_W + GAP;
+      const profile = visible.map(([price, volume]) => {{
+        const thin = volume < medianBar * {s.THIN_OF_AVERAGE};
+        const heavy = volume >= longCutoff;
+        const top = Math.max(R_TOP, yR(price + BIN));
+        const bottom = Math.min(recentBottom, yR(price));
+        if (bottom - top < 0.4) return "";
+        return `<rect x="${{profileX}}" y="${{top}}" width="${{(volume / localMax) * PROFILE_W}}" height="${{bottom - top}}" fill="${{thin ? "#4cc3ff" : heavy ? "#FC6B83" : "#3d4f60"}}" fill-opacity="${{heavy ? 0.55 : 1}}"/>`;
+      }}).join("");
+      const dates = recent.map((bar, index) => `<text x="${{xR(index)}}" y="${{R_HEIGHT - 10}}" text-anchor="middle" fill="#8b98a5" font-size="10">${{bar[0].slice(5).replace("-", "/")}}</text>`).join("");
+      let tip = "";
+      if (hover !== null) {{
+        const bar = recent[hover];
+        const x = Math.min(xR(hover) + 8, LEFT + PRICE_W - 148);
+        tip = `<line x1="${{xR(hover)}}" x2="${{xR(hover)}}" y1="${{R_TOP}}" y2="${{recentBottom}}" stroke="#8b98a5"/>
+          <rect x="${{x}}" y="${{R_TOP + 8}}" width="140" height="78" fill="#141a20" stroke="#31404c"/>
+          <text x="${{x + 8}}" y="${{R_TOP + 26}}" fill="#e8eef2" font-size="12">${{bar[0]}}</text>
+          <text x="${{x + 8}}" y="${{R_TOP + 44}}" fill="#8b98a5" font-size="11">O ${{bar[1].toFixed(2)}}  C ${{bar[4].toFixed(2)}}</text>
+          <text x="${{x + 8}}" y="${{R_TOP + 60}}" fill="#8b98a5" font-size="11">H ${{bar[2].toFixed(2)}}  L ${{bar[3].toFixed(2)}}</text>
+          <text x="${{x + 8}}" y="${{R_TOP + 76}}" fill="#8b98a5" font-size="11">${{(bar[5] / 1e6).toFixed(1)}}M shares</text>`;
+      }}
+      recentSvg.innerHTML = `<text x="${{LEFT}}" y="12" fill="#8b98a5" font-size="11">Price (USD)</text>${{grid}}${{zoneBands(yR, R_TOP, recentBottom)}}${{candles}}
+        <text x="${{profileX}}" y="12" fill="#8b98a5" font-size="11">Volume at price</text>${{profile}}${{dates}}${{tip}}`;
+    }}
+    svg.addEventListener("mousemove", (event) => {{
+      const rect = svg.getBoundingClientRect();
+      const x = (event.clientX - rect.left) * (WIDTH / rect.width);
+      if (x < LEFT || x > LEFT + PRICE_W) {{ draw(null); return; }}
+      const index = Math.round(((x - LEFT) / PRICE_W) * (n - 1));
+      draw(Math.max(0, Math.min(n - 1, index)));
+    }});
+    svg.addEventListener("mouseleave", () => draw(null));
+    recentSvg.addEventListener("mousemove", (event) => {{
+      const rect = recentSvg.getBoundingClientRect();
+      const x = (event.clientX - rect.left) * (WIDTH / rect.width);
+      if (x < LEFT || x > LEFT + PRICE_W) {{ drawRecent(null); return; }}
+      const index = Math.floor((x - LEFT) / (PRICE_W / RECENT_N));
+      drawRecent(Math.max(0, Math.min(RECENT_N - 1, index)));
+    }});
+    recentSvg.addEventListener("mouseleave", () => drawRecent(null));
+    draw(null);
+    drawRecent(null);
+  </script>
+</body>
+</html>
 '''
 
 
@@ -600,6 +961,39 @@ def versus_cell(value: float | None) -> str:
     if value is None:
         return '<td class="num">—</td>'
     return f'<td class="num cyan">{value:.1f}%</td>'
+
+
+def zone_width_percent(label: str | None, price: float) -> float | None:
+    """Blue-zone high minus low, as a percent of the last price."""
+    bounds = zone_bounds(label)
+    if bounds is None or price <= 0:
+        return None
+    low, high = bounds
+    if high < low:
+        return None
+    return (high - low) / price * 100
+
+
+def above_low_text(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.1f}%"
+
+
+def zone_width_text(zone_two: str | None, zone_three: str | None, price: float) -> str:
+    two = zone_width_percent(zone_two, price)
+    three = zone_width_percent(zone_three, price)
+
+    def fmt(value: float) -> str:
+        return f"{value:.1f}%"
+
+    if two is None and three is None:
+        return "—"
+    if two is not None and three is not None:
+        if abs(two - three) < 0.05:
+            return fmt(two)
+        return f"2y {fmt(two)} · 3y {fmt(three)}"
+    return fmt(two if two is not None else three)
 
 
 def zone_bounds(label: str | None) -> tuple[float, float] | None:
@@ -719,6 +1113,58 @@ def save_zone_hits(screen_day: date, hits: list[dict]) -> None:
     write_atomic(ZONE_HITS_PATH, json.dumps(payload, indent=2) + "\n")
 
 
+def load_kept(screen_day: date) -> list[tuple]:
+    try:
+        data = json.loads(KEPT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict) or data.get("date") != screen_day.isoformat():
+        return []
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        return []
+    kept = []
+    for raw in rows:
+        if isinstance(raw, list) and len(raw) >= 15 and raw[0]:
+            kept.append(tuple(raw[:15]))
+    return kept
+
+
+def save_kept(screen_day: date, rows: list[tuple]) -> None:
+    payload = {"date": screen_day.isoformat(), "rows": [list(row[:15]) for row in rows]}
+    write_atomic(KEPT_PATH, json.dumps(payload) + "\n")
+
+
+def hold_traded_names(
+    screen_day: date,
+    matches: list[tuple],
+    quotes: dict[str, dict] | None,
+    as_of: date,
+) -> list[tuple]:
+    """Keep a name on the table for the rest of the day after it trades inside a zone."""
+    traded = s.traded_inside
+    present = {match[0] for match in matches}
+    held = []
+    for row in load_kept(screen_day):
+        symbol = str(row[0])
+        traded.add(symbol)
+        if symbol in present:
+            continue
+        quote = (quotes or {}).get(symbol)
+        if quote and quote.get("day") == as_of and quote.get("price", 0) > 0:
+            volume = quote.get("volume") or row[11]
+            row = (
+                symbol, float(quote["price"]), row[2], row[3], row[4], row[5],
+                row[6], row[7], row[8], row[9], row[10],
+                float(volume) if volume else row[11],
+                row[12], row[13], row[14],
+            )
+        held.append(row)
+    combined = list(matches) + held
+    save_kept(screen_day, [match for match in combined if match[0] in traded])
+    return combined
+
+
 def record_zone_hits(
     screen_day: date,
     matches: list[tuple],
@@ -736,20 +1182,31 @@ def record_zone_hits(
     ) in matches:
         if symbol in seen:
             continue
-        found = first_zone_print(api_key, symbol, screen_day, zone_two, zone_three)
-        if found is None:
-            if not trading_in_zone(price, zone_two, zone_three):
-                continue
-            touch_at, touch_price = updated, price
+        saved = s.breach_context.get(symbol)
+        if saved:
+            touch_at = saved["when"].astimezone(CENTRAL)
+            touch_price = float(saved["price"])
+            prior = float(saved["prior"] or 0)
+            week_base = float(saved["week_base"] or 0)
+            day_value = (touch_price / prior - 1) * 100 if prior > 0 else day_change
+            week_value = (touch_price / week_base - 1) * 100 if week_base > 0 else change
         else:
-            touch_at, touch_price = found
+            found = first_zone_print(api_key, symbol, screen_day, zone_two, zone_three)
+            if found is None:
+                if not trading_in_zone(price, zone_two, zone_three):
+                    continue
+                touch_at, touch_price = updated, price
+            else:
+                touch_at, touch_price = found
+            day_value = change_at(price, day_change, touch_price)
+            week_value = change_at(price, change, touch_price)
         stamp = touch_at.strftime("%-I:%M %p CT")
         hits.append({
             "symbol": symbol,
             "etf": etfs.get(symbol, "—"),
             "price": touch_price,
-            "day": change_at(price, day_change, touch_price),
-            "week": change_at(price, change, touch_price),
+            "day": day_value,
+            "week": week_value,
             "timeframe": timeframe,
             "zone_two": zone_two,
             "versus_two": versus_two,
@@ -814,7 +1271,7 @@ def render_dashboard(
     for (
         symbol, price, change, _average_volume, average_range,
         timeframe, zone_two, versus_two, zone_three, versus_three,
-        _above, session_volume, market_cap, day_change, short_float,
+        above_low, session_volume, market_cap, day_change, short_float,
     ) in matches:
         link = links.get(symbol)
         symbol_cell = f'<Text>[{symbol}]({link})</Text>' if link else f'"{symbol}"'
@@ -822,6 +1279,7 @@ def render_dashboard(
             "  [\n"
             f"    {symbol_cell},\n"
             f'    "{funds.get(symbol, "—")}",\n'
+            f'    "{price:.2f}",\n'
             f'    "{day_text(day_change)}",\n'
             f'    "{week_text(change)}",\n'
             f'    "{s.format_volume(averages[symbol]) if symbol in averages else "—"}",\n'
@@ -830,11 +1288,7 @@ def render_dashboard(
             f'    "{short_float}",\n'
             f'    "{average_range:.1f}%",\n'
             f'    "{timeframe}",\n'
-            f'    "{price:.2f}",\n'
-            f'    "{zone_two or "—"}",\n'
-            f'    "{versus_text(versus_two)}",\n'
-            f'    "{zone_three or "—"}",\n'
-            f'    "{versus_text(versus_three)}",\n'
+            f'    "{above_low_text(above_low)}",\n'
             "  ],"
         )
     row_block = "\n".join(rows)
@@ -842,9 +1296,9 @@ def render_dashboard(
     table = ""
     if rows:
         table = f'''      <Table
-        headers={{["Symbol", "2x ETF", "Day", "Week", "Avg volume", "Volume", "Market cap", "Short float", "Avg range", "Timeframe", "Price", "2-year zone", "2-year vs avg", "3-year zone", "3-year vs avg"]}}
+        headers={{["Symbol", "2x ETF", "Price", "Day", "Week", "Avg volume", "Volume", "Market cap", "Short float", "Avg range", "Timeframe", "Above 2y low"]}}
         rows={{ROWS}}
-        columnAlign={{["left", "left", "right", "right", "right", "right", "right", "right", "right", "left", "right", "left", "right", "left", "right"]}}
+        columnAlign={{["left", "left", "right", "right", "right", "right", "right", "right", "right", "right", "left", "right"]}}
         striped
       />'''
     rows_const = f"const ROWS = [\n{row_block}\n];\n\n" if rows else ""
@@ -863,12 +1317,12 @@ def render_dashboard(
       </Stack>
       <Row gap={{24}} align="end" wrap>
         <Stat value="{liquid}" label="Average 5M shares and a 5% range" />
-        <Stat value="{declined}" label="Down at least 20% over five sessions" />
+        <Stat value="{declined}" label="Down at least 19% over five sessions" />
         <Stat value="{len(matches)}" label="In a blue zone, above the lows" tone="warning" />
       </Row>
       {table}
       <Text size="small" tone="tertiary">
-        Source: Polygon adjusted daily volume. Profile highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. Leveraged ETFs are excluded from the screen. The 2x ETF column is the largest 2x long fund for that stock. Avg volume is the mean daily share volume over the last year. Volume is today's shares. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. The week is the latest close versus the close five sessions earlier. Market cap has to be above $2 billion. Short float is from Finviz. The profile is the prior two years or three years through {base_label}, {screen_day.year}. A blue zone is a bar shorter than 20% of the average bar. The close has to sit in one, or within 4 bars of one, on either profile. Names within 15% of the two-year low are left out.
+        Source: Polygon adjusted daily volume. Profile highs and lows run from 4:00 a.m. to 8:00 p.m. Eastern. Leveraged ETFs are excluded from the screen. The 2x ETF column is the largest 2x long fund for that stock. Avg volume is the mean daily share volume over the last year. Volume is today's shares. The screen still requires a 5 million share average over the last 20 sessions. Range is the mean of the last year. The week is the close five sessions earlier. When price trades inside a blue zone, the week and day percents are taken at that breach instead of at the close. Market cap has to be above $2 billion. Short float is from Finviz. The profile is the prior two years or three years through {base_label}, {screen_day.year}. A blue zone is a bar shorter than 30% of the median bar. The close has to sit in one, or within 4 bars of one, on either profile. A name also passes when price traded inside a blue zone from 4:00 a.m. to 8:00 p.m. Eastern while down at least 19%. Names within 25% of the two-year low are left out. Above 2y low is the setup price versus that low.
       </Text>
     </Stack>
   );
@@ -890,6 +1344,17 @@ def pct_class(text: str) -> str:
 
 
 SCREEN_HEADERS = ["Ticker", "Last", "Day", "Volume", "Float", "Short float"]
+INSIDE_HEADERS = [
+    "Symbol",
+    "Price",
+    "% Change",
+    "Current Volume",
+    "Avg Volume",
+    "Country",
+    "Market Cap",
+    "Float",
+    "Short % of Float",
+]
 
 
 def quote_row(ticker: str, last: str, day: str, volume: str, shares: str, short: str) -> list[tuple[str, str]]:
@@ -927,11 +1392,19 @@ def fresh_names(key: str, symbols: list[str] | None, prior: dict[str, list[str]]
     return set(symbols) - set(prior[key])
 
 
+def row_ticker(row: list[tuple[str, str]]) -> str:
+    for text, css in row:
+        if "symbol" in css.split():
+            return text
+    return row[0][0] if row else ""
+
+
 def section_table(
     headers: list[str],
     rows: list[list[tuple[str, str]]] | None,
     noun: str,
     fresh: set[str] | None = None,
+    panel_class: str = "panel",
 ) -> str:
     fresh = fresh or set()
     if rows is None:
@@ -941,63 +1414,26 @@ def section_table(
     else:
         lines = []
         for row in rows:
-            ticker = row[0][0]
+            ticker = row_ticker(row)
             arrived = ticker in fresh
             cells = []
-            for index, (text, css) in enumerate(row):
+            for text, css in row:
                 shown = html.escape(text)
-                if index == 0 and arrived:
+                if "symbol" in css.split() and arrived:
                     shown += ' <span class="new">New</span>'
                 cells.append(f'<td class="{css}">{shown}</td>')
             attr = ' class="fresh"' if arrived else ""
             lines.append(f"<tr{attr}>" + "".join(cells) + "</tr>")
         body = "\n".join(lines)
     heads = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
-    count = "—" if rows is None else str(len(rows))
-    return f'''<section class="panel">
-    <h2>{html.escape(noun)} <span>{count}</span></h2>
+    return f'''<section class="{html.escape(panel_class)}">
+    <h2>{html.escape(noun)}</h2>
     <table>
       <thead><tr>{heads}</tr></thead>
       <tbody>
         {body}
       </tbody>
     </table>
-    </section>'''
-
-
-def render_zone_log(hits: list[dict]) -> str:
-    body = []
-    for hit in hits:
-        week = hit.get("week")
-        body.append(
-            "<tr>"
-            f'<td class="symbol">{html.escape(str(hit.get("symbol") or ""))}</td>'
-            f'<td class="symbol">{html.escape(str(hit.get("etf") or "—"))}</td>'
-            f'<td>{html.escape(str(hit.get("hit") or "—"))}</td>'
-            f'<td class="num">{float(hit["price"]):.2f}</td>'
-            f'<td class="num {tone(hit.get("day"))}">{day_text(hit.get("day"))}</td>'
-            f'<td class="num {tone(week)}">{week_text(week) if week is not None else "—"}</td>'
-            f'<td>{html.escape(str(hit.get("timeframe") or "—"))}</td>'
-            f'{zone_cell(hit.get("zone_two"))}'
-            f'{versus_cell(hit.get("versus_two"))}'
-            f'{zone_cell(hit.get("zone_three"))}'
-            f'{versus_cell(hit.get("versus_three"))}'
-            "</tr>"
-        )
-    rows = "\n".join(body) if body else '<tr><td colspan="11" class="empty">No name has traded inside a zone today.</td></tr>'
-    return f'''<section class="panel">
-    <h2>HIT THE ZONE <span>{len(hits)}</span></h2>
-    <table class="zone-log">
-      <thead>
-        <tr>
-          <th>Symbol</th><th>2x ETF</th><th>Hit</th><th>Last</th><th>Day</th><th>Week</th><th>Timeframe</th><th>2-year zone</th><th>2-year vs avg</th><th>3-year zone</th><th>3-year vs avg</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows}
-      </tbody>
-    </table>
-    <p class="note">The first time each name's price traded inside its two-year or three-year zone today. It stays here after the price leaves.</p>
     </section>'''
 
 
@@ -1013,7 +1449,7 @@ def render_page(
     fresh: set[str] | None = None,
     year_volumes: dict[str, float] | None = None,
     etfs: dict[str, str] | None = None,
-    zone_hits: list[dict] | None = None,
+    qqq_high: str = "",
 ) -> str:
     updated_label = updated.strftime("%-I:%M %p CT")
     session_label = screen_day.strftime("%b %-d, %Y")
@@ -1023,12 +1459,11 @@ def render_page(
     arrived = fresh or set()
     averages = year_volumes or {}
     funds = etfs or {}
-    zone_log = render_zone_log(zone_hits or [])
     body = []
     for (
         symbol, price, change, _average_volume, average_range,
         timeframe, zone_two, versus_two, zone_three, versus_three,
-        _above, session_volume, market_cap, day_change, short_float,
+        above_low, session_volume, market_cap, day_change, short_float,
     ) in matches:
         is_new = symbol in arrived
         new_mark = ' <span class="new">New</span>' if is_new else ""
@@ -1038,27 +1473,25 @@ def render_page(
         if trading_in_zone(price, zone_two, zone_three):
             classes.append("in-zone")
         row_class = " ".join(classes)
-        fund = funds.get(symbol, "—")
+        fund = funds.get(symbol, "")
+        etf = f'<span class="etf">({html.escape(fund)})</span>' if fund and fund != "—" else ""
         body.append(
             f'<tr class="{row_class}">'
-            f'<td class="symbol">{html.escape(symbol)}{new_mark}</td>'
-            f'<td class="symbol">{html.escape(fund)}</td>'
+            f'<td class="symbol">{chart_anchor(symbol)}{new_mark}{etf}</td>'
+            f'<td class="num">{price:.2f}</td>'
             f'<td class="num {tone(day_change)}">{day_text(day_change)}</td>'
             f'<td class="num {tone(change)}">{week_text(change)}</td>'
-            f'<td class="num">{s.format_volume(averages[symbol]) if symbol in averages else "—"}</td>'
             f'<td class="num">{s.format_volume(session_volume)}</td>'
+            f'<td class="num">{s.format_volume(averages[symbol]) if symbol in averages else "—"}</td>'
             f'<td class="num">{format_cap(market_cap)}</td>'
             f'<td class="num">{html.escape(short_float)}</td>'
             f'<td class="num">{average_range:.1f}%</td>'
             f'<td>{html.escape(timeframe)}</td>'
-            f'<td class="num">{price:.2f}</td>'
-            f'{zone_cell(zone_two)}'
-            f'{versus_cell(versus_two)}'
-            f'{zone_cell(zone_three)}'
-            f'{versus_cell(versus_three)}'
+            f'<td{" class=\"hit-yes\"" if symbol in s.traded_inside else ""}>{"Yes" if symbol in s.traded_inside else "No"}</td>'
+            f'<td class="num">{html.escape(above_low_text(above_low))}</td>'
             "</tr>"
         )
-    rows = "\n".join(body) if body else '<tr><td colspan="15" class="empty">No names passed this run.</td></tr>'
+    rows = "\n".join(body) if body else '<tr><td colspan="12" class="empty">No names passed this run.</td></tr>'
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1066,8 +1499,8 @@ def render_page(
   <title>Main Dashboard</title>
   <style>
     :root {{
-      --bg: #0c0f12;
-      --panel: #141a20;
+      --bg: #07090c;
+      --panel: #10161c;
       --line: #24303a;
       --text: #e8eef2;
       --muted: #8b98a5;
@@ -1081,11 +1514,23 @@ def render_page(
       margin: 0;
       min-height: 100vh;
       background:
-        radial-gradient(980px 280px at 0% 0%, rgba(76, 195, 255, 0.10), transparent 58%),
-        radial-gradient(720px 240px at 100% 0%, rgba(0, 184, 92, 0.06), transparent 50%),
+        radial-gradient(900px 320px at 0% -10%, rgba(76, 195, 255, 0.16), transparent 60%),
+        radial-gradient(640px 280px at 100% 0%, rgba(226, 59, 59, 0.08), transparent 55%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 180px),
         var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    body::before {{
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(76, 195, 255, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(76, 195, 255, 0.035) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: linear-gradient(180deg, #000 0%, transparent 70%);
     }}
     header {{
       position: sticky;
@@ -1093,19 +1538,29 @@ def render_page(
       z-index: 3;
       display: flex;
       align-items: center;
-      gap: 14px;
-      padding: 14px 22px;
-      background: rgba(12, 15, 18, 0.88);
-      border-bottom: 1px solid var(--line);
-      box-shadow: inset 0 -1px 0 rgba(76, 195, 255, 0.45);
+      gap: 16px;
+      padding: 8px 20px;
+      background: rgba(7, 9, 12, 0.86);
+      border-bottom: 1px solid rgba(76, 195, 255, 0.28);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
       backdrop-filter: blur(18px);
     }}
     header h1 {{
       margin: 0;
-      font-size: 15px;
-      letter-spacing: 0.18em;
-      font-weight: 700;
+      font-size: 18px;
+      letter-spacing: 0.28em;
+      font-weight: 800;
       text-transform: uppercase;
+    }}
+    header h1::before {{
+      content: "";
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      margin-right: 12px;
+      background: var(--cyan);
+      box-shadow: 0 0 14px var(--cyan);
+      vertical-align: 1px;
     }}
     .badge {{
       display: inline-flex;
@@ -1117,8 +1572,8 @@ def render_page(
       padding: 5px 9px;
       border-radius: 999px;
     }}
-    .badge.live {{ color: #04140a; background: var(--up); }}
-    .badge.closed {{ color: #1a1208; background: var(--gold); }}
+    .badge.live {{ color: #04140a; background: var(--up); box-shadow: 0 0 18px rgba(0, 184, 92, 0.45); }}
+    .badge.closed {{ color: #1a1208; background: var(--gold); box-shadow: 0 0 18px rgba(245, 193, 108, 0.28); }}
     .pip {{
       width: 7px;
       height: 7px;
@@ -1131,17 +1586,43 @@ def render_page(
       70% {{ box-shadow: 0 0 0 6px rgba(4, 20, 10, 0); }}
       100% {{ box-shadow: 0 0 0 0 rgba(4, 20, 10, 0); }}
     }}
-    .clock {{ margin-left: auto; color: #ffffff; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; }}
-    main {{ padding: 18px 22px 36px; display: flex; flex-direction: column; gap: 16px; }}
+    .clock {{ margin-left: auto; color: #ffffff; font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; letter-spacing: 0.04em; }}
+    main {{ position: relative; padding: 10px 20px 16px; display: flex; flex-direction: column; gap: 8px; }}
     .panel {{
+      position: relative;
       background:
-        linear-gradient(180deg, rgba(76, 195, 255, 0.06), transparent 48px),
+        linear-gradient(180deg, rgba(76, 195, 255, 0.07), transparent 56px),
         var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 12px;
+      border: 1px solid rgba(76, 195, 255, 0.14);
+      border-radius: 2px;
       overflow: hidden;
-      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
     }}
+    .panel::before {{
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: linear-gradient(180deg, var(--cyan), transparent 80%);
+    }}
+    main > section:last-child {{
+      border-color: rgba(76, 195, 255, 0.42);
+      box-shadow: 0 0 0 1px rgba(76, 195, 255, 0.12), 0 22px 60px rgba(0, 0, 0, 0.5);
+    }}
+    .panel.wide {{ overflow-x: auto; }}
+    .panel.wide table {{ table-layout: fixed; width: 100%; }}
+    .panel.wide th:nth-child(1), .panel.wide td:nth-child(1) {{ width: 12%; }}
+    .panel.wide th:nth-child(2), .panel.wide td:nth-child(2) {{ width: 9%; }}
+    .panel.wide th:nth-child(3), .panel.wide td:nth-child(3) {{ width: 10%; }}
+    .panel.wide th:nth-child(4), .panel.wide td:nth-child(4) {{ width: 14%; }}
+    .panel.wide th:nth-child(5), .panel.wide td:nth-child(5) {{ width: 13%; }}
+    .panel.wide th:nth-child(6), .panel.wide td:nth-child(6) {{ width: 10%; }}
+    .panel.wide th:nth-child(7), .panel.wide td:nth-child(7) {{ width: 12%; }}
+    .panel.wide th:nth-child(8), .panel.wide td:nth-child(8) {{ width: 10%; }}
+    .panel.wide th:nth-child(9), .panel.wide td:nth-child(9) {{ width: 10%; }}
+    td.text {{ text-align: left; }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -1149,46 +1630,65 @@ def render_page(
     }}
     th {{
       text-align: right;
-      padding: 9px 14px 11px;
-      color: var(--muted);
-      font-size: 11px;
+      padding: 4px 10px;
+      color: #7f8d9b;
+      font-size: 10px;
       font-weight: 700;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.14em;
       text-transform: uppercase;
       border-bottom: 1px solid var(--line);
-      background: rgba(16, 22, 28, 0.72);
+      background: #0c1218;
     }}
     td {{
-      padding: 11px 14px;
-      border-bottom: 1px solid #1c262e;
+      padding: 3px 10px;
+      border-bottom: 1px solid rgba(36, 48, 58, 0.7);
       font-variant-numeric: tabular-nums;
-      font-size: 15px;
+      font-size: 14px;
+      line-height: 1.25;
     }}
     tbody tr:last-child td {{ border-bottom: 0; }}
-    tbody tr:hover td {{ background: #1a232c; }}
+    tbody tr:nth-child(even):not(.fresh):not(.in-zone) td {{ background: rgba(255, 255, 255, 0.02); }}
+    tbody tr:hover td {{ background: rgba(76, 195, 255, 0.08); }}
     th:first-child, td:first-child {{ text-align: left; }}
     table.blotter td {{ color: #ffffff; }}
     table.blotter td.up {{ color: var(--up); }}
     table.blotter td.down {{ color: var(--down); }}
     table.blotter .cyan, table.blotter .zone {{ color: var(--cyan); }}
-    table.blotter th:nth-child(2), table.blotter td:nth-child(2),
+    table.blotter th:nth-child(9), table.blotter td:nth-child(9),
     table.blotter th:nth-child(10), table.blotter td:nth-child(10),
     table.blotter th:nth-child(12), table.blotter td:nth-child(12),
     table.blotter th:nth-child(14), table.blotter td:nth-child(14) {{ text-align: left; }}
+    table.blotter a.chart-link {{
+      color: #ffffff;
+      text-decoration: underline;
+      text-decoration-color: var(--cyan);
+      text-underline-offset: 3px;
+    }}
+    table.blotter a.chart-link:hover {{ color: var(--cyan); }}
+    table.blotter td .etf {{
+      display: inline;
+      margin-left: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+    }}
     tr.fresh td {{ background: #2c2618; }}
     tr.fresh:hover td {{ background: #3a3222; }}
     table.blotter tr.in-zone td {{ background: #123848; }}
     table.blotter tr.in-zone:hover td {{ background: #18506a; }}
     table.blotter tr.in-zone td:first-child {{ box-shadow: inset 3px 0 0 var(--cyan); }}
-    table.zone-log th:nth-child(2), table.zone-log td:nth-child(2),
-    table.zone-log th:nth-child(3), table.zone-log td:nth-child(3),
-    table.zone-log th:nth-child(7), table.zone-log td:nth-child(7),
-    table.zone-log th:nth-child(8), table.zone-log td:nth-child(8),
-    table.zone-log th:nth-child(10), table.zone-log td:nth-child(10) {{ text-align: left; }}
+    table.blotter td.hit-yes,
+    table.blotter tr:hover td.hit-yes,
+    table.blotter tr.fresh td.hit-yes,
+    table.blotter tr.fresh:hover td.hit-yes,
+    table.blotter tr.in-zone td.hit-yes,
+    table.blotter tr.in-zone:hover td.hit-yes {{ color: var(--cyan); }}
     .symbol {{
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
       font-weight: 700;
-      letter-spacing: 0.06em;
+      font-size: 15px;
+      letter-spacing: 0.08em;
     }}
     .new {{
       color: #1a1208;
@@ -1203,41 +1703,38 @@ def render_page(
       vertical-align: 1px;
     }}
     .num {{ text-align: right; font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
-    .up {{ color: var(--up); }}
-    .down {{ color: var(--down); }}
+    .up {{ color: var(--up); text-shadow: 0 0 12px rgba(0, 184, 92, 0.28); }}
+    .down {{ color: var(--down); text-shadow: 0 0 12px rgba(226, 59, 59, 0.28); }}
     .cyan {{ color: var(--cyan); }}
     .zone {{
       display: inline-block;
       color: var(--cyan);
-      background: #102734;
-      border: 1px solid #1d4d66;
-      border-radius: 999px;
-      padding: 3px 9px;
+      background: rgba(76, 195, 255, 0.08);
+      border: 1px solid rgba(76, 195, 255, 0.45);
+      border-radius: 2px;
+      padding: 0 6px;
       font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 13px;
+      font-size: 12px;
+      box-shadow: 0 0 16px rgba(76, 195, 255, 0.12);
     }}
     .empty {{ color: var(--muted); text-align: left; }}
+    h2 .qqq-high {{
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      font-variant-numeric: tabular-nums;
+    }}
+    h2 .qqq-high.down {{ color: var(--down); }}
+    h2 .qqq-high.up {{ color: var(--up); }}
     h2 {{
       display: flex;
       align-items: center;
       gap: 10px;
       margin: 0;
-      padding: 13px 16px 11px;
-      font-size: 12px;
-      letter-spacing: 0.16em;
-      font-weight: 700;
-    }}
-    h2 span {{
-      margin-left: auto;
-      color: var(--cyan);
-      min-width: 1.7em;
-      padding: 2px 8px;
-      text-align: center;
-      font-variant-numeric: tabular-nums;
-      letter-spacing: 0;
-      background: rgba(76, 195, 255, 0.12);
-      border: 1px solid rgba(76, 195, 255, 0.38);
-      border-radius: 999px;
+      padding: 6px 14px 5px 16px;
+      font-size: 13px;
+      letter-spacing: 0.22em;
+      font-weight: 800;
     }}
     .hide {{
       margin-left: 10px;
@@ -1252,7 +1749,7 @@ def render_page(
     .hide:hover {{ color: var(--text); }}
     tr.hidden {{ display: none; }}
     .show-hidden {{
-      margin-left: 8px;
+      margin-left: auto;
       border: 1px solid var(--line);
       background: transparent;
       color: var(--muted);
@@ -1281,11 +1778,11 @@ def render_page(
   <main>
     {extra}
     <section class="panel">
-    <h2>CAPITULATION <span>{len(matches)}</span></h2>
+    <h2>CAPITULATION{qqq_high}</h2>
     <table class="blotter">
       <thead>
         <tr>
-          <th>Symbol</th><th>2x ETF</th><th>Day</th><th>Week</th><th>Avg volume</th><th>Volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Timeframe</th><th>Last</th><th>2-year zone</th><th>2-year vs avg</th><th>3-year zone</th><th>3-year vs avg</th>
+          <th>Symbol</th><th>Last</th><th>Day</th><th>Week</th><th>Volume</th><th>Avg volume</th><th>Market cap</th><th>Short float</th><th>Avg range</th><th>Timeframe</th><th>Hit Blue Zone Today</th><th title="Setup price versus the lowest price of the last two years">Above 2y low</th>
         </tr>
       </thead>
       <tbody>
@@ -1293,7 +1790,6 @@ def render_page(
       </tbody>
     </table>
     </section>
-    {zone_log}
   </main>
   <script>
     const hiddenKey = "dashboard-hidden-rows";
@@ -1317,7 +1813,7 @@ def render_page(
       const cell = row.querySelector(".symbol");
       if (!cell) return "";
       const copy = cell.cloneNode(true);
-      copy.querySelectorAll(".new, .hide").forEach((node) => node.remove());
+      copy.querySelectorAll(".new, .hide, .etf").forEach((node) => node.remove());
       return copy.textContent.trim();
     }}
     function paint() {{
@@ -1390,12 +1886,66 @@ def load_screener(key: str, folder: str):
     return module
 
 
-def inside_day_rows(as_of: date) -> list[list[tuple[str, str]]]:
-    mod = load_screener("inside_day_screener", "inside-day-screener")
-    api_key = mod.load_api_key()
-    universe = mod.load_symbols()
-    sessions = mod.load_sessions(api_key, as_of)
-    matches = mod.find_matches(universe, sessions, None)
+MIN_CURRENT_VOLUME = 500_000
+
+
+def current_shares(quotes: dict | None, symbol: str) -> float:
+    """Shares traded today since 4:00 a.m. Eastern."""
+    if not quotes:
+        return 0.0
+    quote = quotes.get(symbol)
+    if not quote:
+        return 0.0
+    return float(quote.get("volume") or 0)
+
+
+def current_volume_text(quotes: dict | None, symbol: str) -> str:
+    volume = current_shares(quotes, symbol)
+    if volume <= 0:
+        return "—"
+    return f"{int(volume):,}"
+
+
+def screen_cells(row: dict) -> list[tuple[str, str]]:
+    """Inside Day columns: symbol, price, day change, volume, and Finviz size."""
+    return [
+        (row["Symbol"], "symbol"),
+        (row["Price"], "num"),
+        (row["% Change"], f"num {pct_class(row['% Change'])}"),
+        (row.get("Current Volume") or "—", "num"),
+        (row["Avg Volume"], "num"),
+        (row["Country"], "text"),
+        (row["Market Cap"], "num"),
+        (row["Float"], "num"),
+        (row["Short % of Float"], "num"),
+    ]
+
+
+def finviz_profile(ticker: str) -> tuple[str, str, str, str]:
+    """Country, market cap, float, and short float from Finviz."""
+    mod = load_screener("inside_day_quote", "inside-day-screener")
+    try:
+        snapshot, country = mod.finviz_quote(mod.requests.Session(), ticker)
+    except Exception:
+        return "—", "—", "—", "—"
+    return (
+        country or "—",
+        snapshot.get("Market Cap") or "—",
+        snapshot.get("Shs Float") or "—",
+        snapshot.get("Short Float") or "—",
+    )
+
+
+def inside_detail_rows(
+    mod,
+    api_key: str,
+    sessions: list,
+    matches: list[dict],
+    quotes: dict | None,
+) -> list[list[tuple[str, str]]]:
+    """Volume rank, size limits, and the inside-day columns for one set of matches."""
+    if not matches:
+        return []
     screen_day = sessions[0][0]
     two_day_dates = {sessions[0][0], sessions[1][0]}
     three_day_dates = two_day_dates | {sessions[2][0]}
@@ -1424,26 +1974,54 @@ def inside_day_rows(as_of: date) -> list[list[tuple[str, str]]]:
             if not mod.over_size_limit(row):
                 details.append(row)
     details.sort(key=lambda row: mod.sort_percent(row["% Change"]), reverse=True)
-    rendered = []
-    for row in details:
-        rendered.append(quote_row(
-            row["Symbol"],
-            row["Price"].replace(",", ""),
-            row["% Change"],
-            row["Volume"],
-            row["Finviz Shares Float"],
-            row["Finviz Short % of Float"],
-        ))
-    return rendered
+    details = [row for row in details if current_shares(quotes, row["Symbol"]) > MIN_CURRENT_VOLUME]
+    return [
+        screen_cells({
+            "Symbol": row["Symbol"],
+            "Price": row["Price"],
+            "% Change": row["% Change"],
+            "3-Day %": row["3-Day %"],
+            "Avg Volume": row["Avg Volume"],
+            "Current Volume": current_volume_text(quotes, row["Symbol"]),
+            "Country": row["Country"],
+            "Market Cap": row["Finviz Market Cap"],
+            "Float": row["Finviz Shares Float"],
+            "Short % of Float": row["Finviz Short % of Float"],
+        })
+        for row in details
+    ]
 
 
-def double_inside_rows(as_of: date) -> list[list[tuple[str, str]]]:
+def inside_day_board(
+    as_of: date, quotes: dict | None = None
+) -> tuple[list[list[tuple[str, str]]], list[list[tuple[str, str]]]]:
+    """Inside days, and names that were inside days before breaking the prior high."""
+    mod = load_screener("inside_day_screener", "inside-day-screener")
+    api_key = mod.load_api_key()
+    universe = mod.load_symbols()
+    sessions = mod.load_sessions(api_key, as_of)
+    inside_matches, continuation_matches = mod.find_matches(
+        universe, sessions, None, api_key, include_continuations=True
+    )
+    inside_rows = inside_detail_rows(mod, api_key, sessions, inside_matches, quotes)
+    continuation_rows = inside_detail_rows(mod, api_key, sessions, continuation_matches, quotes)
+    s.log(f"Inside day: {len(inside_rows)} names")
+    s.log(f"Inside day continuations: {len(continuation_rows)} names")
+    return inside_rows, continuation_rows
+
+
+def double_inside_rows(as_of: date, quotes: dict | None = None) -> list[list[tuple[str, str]]]:
     mod = load_screener("double_inside_day_screener", "double-inside-day-screener")
     api_key = mod.load_api_key()
     universe = mod.load_symbols()
     sessions = mod.load_sessions(api_key, as_of)
     matches = mod.find_matches(universe, sessions, None)
     screen_day = sessions[0][0]
+    three_sessions_ago = sessions[3][1]
+    for match in matches:
+        earlier = three_sessions_ago.get(match["symbol"])
+        base = earlier[0] if earlier else 0
+        match["three_day_change"] = (match["price"] - base) / base * 100 if base else None
     with s_pool(mod.DETAIL_WORKERS) as pool:
         jobs = {
             pool.submit(mod.average_volume, api_key, match["symbol"], screen_day): match
@@ -1457,21 +2035,28 @@ def double_inside_rows(as_of: date) -> list[list[tuple[str, str]]]:
                 match["average_volume"] = None
     with s_pool(mod.DETAIL_WORKERS) as pool:
         details = list(pool.map(mod.fetch_row, matches))
-    details.sort(key=lambda row: mod.sort_percent(row["Up Day %"]), reverse=True)
-    rendered = []
-    for row in details:
-        rendered.append(quote_row(
-            row["Symbol"],
-            row["Price"].replace(",", ""),
-            row["% Change"],
-            row["Volume"],
-            row["Finviz Shares Float"],
-            row["Finviz Short % of Float"],
-        ))
-    return rendered
+    for match, row in zip(matches, details):
+        row["3-Day %"] = mod.fmt_day_change(match.get("three_day_change"))
+    details.sort(key=lambda row: mod.sort_percent(row["% Change"]), reverse=True)
+    details = [row for row in details if current_shares(quotes, row["Symbol"]) > MIN_CURRENT_VOLUME]
+    return [
+        screen_cells({
+            "Symbol": row["Symbol"],
+            "Price": row["Price"],
+            "% Change": row["% Change"],
+            "3-Day %": row["3-Day %"],
+            "Avg Volume": row["Avg Volume"],
+            "Current Volume": current_volume_text(quotes, row["Symbol"]),
+            "Country": row["Country"],
+            "Market Cap": row["Finviz Market Cap"],
+            "Float": row["Finviz Shares Float"],
+            "Short % of Float": row["Finviz Short % of Float"],
+        })
+        for row in details
+    ]
 
 
-def nine_sma_rows(as_of: date) -> list[list[tuple[str, str]]]:
+def nine_sma_rows(as_of: date, quotes: dict | None = None) -> list[list[tuple[str, str]]]:
     mod = load_screener("nine_sma_screener", "9sma-screener")
     universe = mod.load_symbols()
     api_key = mod.load_api_key()
@@ -1495,29 +2080,39 @@ def nine_sma_rows(as_of: date) -> list[list[tuple[str, str]]]:
     for symbol, match in matches:
         if mod.is_six_month_high(api_key, symbol, screen_day, match["run_high"]):
             confirmed.append((symbol, match))
-    confirmed.sort(key=lambda item: item[1]["run_change"], reverse=True)
-    pending = [
-        {
+    confirmed.sort(key=lambda item: item[1]["day_change"], reverse=True)
+    volume_mod = load_screener("double_inside_volume", "double-inside-day-screener")
+
+    def enrich(item: tuple) -> dict:
+        symbol, match, bars = item
+        base = bars[-4][0]
+        three_day = (bars[-1][0] - base) / base * 100 if base else None
+        try:
+            average = volume_mod.average_volume(api_key, symbol, screen_day)
+        except Exception:
+            average = None
+        country, market_cap, shares, short = finviz_profile(symbol)
+        return {
             "Symbol": symbol,
             "Price": mod.fmt_price(match["price"]),
-            "Day": mod.fmt_percent(match["day_change"]),
-            "Volume": mod.fmt_volume(match["volume"]),
+            "% Change": mod.fmt_percent(match["day_change"]),
+            "3-Day %": mod.fmt_percent(three_day) if three_day is not None else "—",
+            "Avg Volume": mod.fmt_volume(average) if average is not None else "—",
+            "Current Volume": current_volume_text(quotes, symbol),
+            "Country": country,
+            "Market Cap": market_cap,
+            "Float": shares,
+            "Short % of Float": short,
         }
+
+    pending = [
+        (symbol, match, by_symbol[symbol])
         for symbol, match in confirmed
+        if current_shares(quotes, symbol) > MIN_CURRENT_VOLUME
     ]
     with s_pool(6) as pool:
-        detailed = list(pool.map(mod.add_finviz, pending))
-    return [
-        quote_row(
-            row["Symbol"],
-            row["Price"],
-            row["Day"],
-            row["Volume"],
-            row["Finviz Shares Float"],
-            row["Finviz Short % of Float"],
-        )
-        for row in detailed
-    ]
+        detailed = list(pool.map(enrich, pending))
+    return [screen_cells(row) for row in detailed]
 
 
 def attach_short_float(matches: list[tuple]) -> list[tuple]:
@@ -1554,14 +2149,16 @@ def safe_screen(label: str, fn, as_of: date):
 PARABOLIC_HEADERS = ["Ticker", "Last", "Day", "Volume", "Float", "Short float", "5 day %"]
 
 
-def parabolic_rows(as_of: date) -> list[list[tuple[str, str]]]:
+def parabolic_rows(as_of: date, quotes: dict | None = None) -> list[list[tuple[str, str]]]:
     mod = load_screener("parabolic_shorts", "parabolic-shorts")
     universe = mod.load_symbols()
     sessions = mod.load_sessions(mod.load_api_key(), as_of)
     matches = mod.find_matches(universe, sessions)
     previous = sessions[1][1]
     pending = []
-    for symbol, close, _prior, change, volume in matches:
+    for symbol, close, _prior, change, _volume in matches:
+        if current_shares(quotes, symbol) <= MIN_CURRENT_VOLUME:
+            continue
         earlier = previous.get(symbol)
         if earlier is not None and earlier[0] > 0:
             day = f"{(close / earlier[0] - 1.0) * 100:+.2f}%"
@@ -1571,7 +2168,7 @@ def parabolic_rows(as_of: date) -> list[list[tuple[str, str]]]:
             "Symbol": symbol,
             "Price": f"{close:.2f}",
             "Day": day,
-            "Volume": f"{round(volume):,}",
+            "Volume": current_volume_text(quotes, symbol),
             "Five": f"{change:+.1f}%",
         })
     nine = load_screener("nine_sma_finviz", "9sma-screener")
@@ -1591,22 +2188,52 @@ def parabolic_rows(as_of: date) -> list[list[tuple[str, str]]]:
     return rows
 
 
-def other_sections(as_of: date) -> tuple[str, dict[str, list[str] | None]]:
-    inside = safe_screen("Inside day", inside_day_rows, as_of)
-    double = safe_screen("Double inside day", double_inside_rows, as_of)
-    sma = safe_screen("9 SMA", nine_sma_rows, as_of)
-    parabolic = safe_screen("Parabolic shorts", parabolic_rows, as_of)
+def other_sections(as_of: date, quotes: dict | None = None) -> tuple[str, dict[str, list[str] | None]]:
+    try:
+        inside, continuations = inside_day_board(as_of, quotes)
+    except Exception as error:
+        s.log(f"Inside day failed: {error}")
+        inside = continuations = None
+    double = safe_screen("Double inside day", lambda day: double_inside_rows(day, quotes), as_of)
+    sma = safe_screen("9 SMA", lambda day: nine_sma_rows(day, quotes), as_of)
+    parabolic = safe_screen("Parabolic shorts", lambda day: parabolic_rows(day, quotes), as_of)
     sections = {
-        "inside": None if inside is None else [row[0][0] for row in inside],
-        "double": None if double is None else [row[0][0] for row in double],
-        "sma": None if sma is None else [row[0][0] for row in sma],
-        "parabolic": None if parabolic is None else [row[0][0] for row in parabolic],
+        "inside": None if inside is None else [row_ticker(row) for row in inside],
+        "continuations": None if continuations is None else [row_ticker(row) for row in continuations],
+        "double": None if double is None else [row_ticker(row) for row in double],
+        "sma": None if sma is None else [row_ticker(row) for row in sma],
+        "parabolic": None if parabolic is None else [row_ticker(row) for row in parabolic],
     }
     prior = load_prior()
     page = "\n".join([
-        section_table(SCREEN_HEADERS, inside, "INSIDE DAY", fresh_names("inside", sections["inside"], prior)),
-        section_table(SCREEN_HEADERS, double, "DOUBLE INSIDE DAY", fresh_names("double", sections["double"], prior)),
-        section_table(SCREEN_HEADERS, sma, "9 SMA", fresh_names("sma", sections["sma"], prior)),
+        section_table(
+            INSIDE_HEADERS,
+            inside,
+            "INSIDE DAY",
+            fresh_names("inside", sections["inside"], prior),
+            "panel wide",
+        ),
+        section_table(
+            INSIDE_HEADERS,
+            continuations,
+            "INSIDE DAY CONTINUATIONS",
+            fresh_names("continuations", sections["continuations"], prior),
+            "panel wide",
+        ),
+        section_table(
+            INSIDE_HEADERS,
+            double,
+            "DOUBLE INSIDE DAY",
+            fresh_names("double", sections["double"], prior),
+            "panel wide",
+        ),
+        section_table(
+            INSIDE_HEADERS,
+            sma,
+            "9 SMA",
+            fresh_names("sma", sections["sma"], prior),
+            "panel wide",
+        ),
         section_table(PARABOLIC_HEADERS, parabolic, "PARABOLIC SHORTS", fresh_names("parabolic", sections["parabolic"], prior)),
     ])
     return page, sections
@@ -1648,6 +2275,7 @@ def refresh(force: bool) -> None:
     etfs = leveraged_etfs()
     names = security_names()
     links: dict[str, Path] = {}
+    matches = [match for match in matches if current_shares(quotes, match[0]) > MIN_CURRENT_VOLUME]
     for match in matches:
         symbol = match[0]
         years = 3 if match[5] == "3 year" else 2
@@ -1657,23 +2285,24 @@ def refresh(force: bool) -> None:
             chart = render_chart(symbol, names.get(symbol, symbol), bars, base_day, screen_day, in_progress, years)
             path = chart_path(symbol)
             write_atomic(path, chart)
+            write_atomic(
+                chart_page_path(symbol),
+                render_chart_html(symbol, names.get(symbol, symbol), bars, base_day, screen_day, in_progress, years),
+            )
             links[symbol] = path
         except Exception as error:
             s.log(f"{symbol}: chart skipped ({error})")
     hours.save()
     matches = attach_short_float(matches)
+    matches = hold_traded_names(screen_day, matches, quotes, as_of)
+    matches = [match for match in matches if current_shares(quotes, match[0]) > MIN_CURRENT_VOLUME]
     matches.sort(key=lambda match: match[13] if match[13] is not None else float("inf"))
     year_volumes = year_average_volumes(api_key, [match[0] for match in matches], screen_day)
-    if regular_session(now_eastern):
-        extra, sections = other_sections(as_of)
-    else:
-        extra = previous_other_sections()
-        prior_sections = load_prior()
-        sections = {key: prior_sections.get(key) for key in ("inside", "double", "sma", "parabolic")}
+    extra, sections = other_sections(as_of, quotes)
+    qqq_high = qqq_from_high(api_key, as_of, quotes)
     prior = load_prior()
     sections["capitulation"] = [match[0] for match in matches]
     updated = datetime.now(CENTRAL)
-    zone_hits = record_zone_hits(screen_day, matches, etfs, updated, api_key)
     dashboard = render_dashboard(updated, screen_day, base_day, matches, liquid, declined, in_progress, links, year_volumes, etfs)
     write_atomic(DASHBOARD, dashboard)
     page = render_page(
@@ -1688,7 +2317,7 @@ def refresh(force: bool) -> None:
         fresh_names("capitulation", sections["capitulation"], prior),
         year_volumes,
         etfs,
-        zone_hits,
+        qqq_high,
     )
     write_atomic(PAGE, page)
     save_prior(sections)

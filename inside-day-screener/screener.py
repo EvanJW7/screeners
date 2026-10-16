@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Scan US-listed stocks for a 30% gain over two or three trading days, 500k volume on the screen day, a 20M day in that window, and a top-5 volume day over nine months.
+"""Scan US-listed stocks for a 30% gain over two or three trading days, 500k volume on the screen day, 15M shares on the prior day, and a top-5 volume day over nine months.
 
-The day before the inside day must trade at least 5% from low to high, so a gap that then sits in a tight range does not qualify.
+The inside day is the 4:00 a.m. to 8:00 p.m. Eastern high and low. The day before must trade at least 5% from that low to that high, so a gap that then sits in a tight range does not qualify.
 """
 
 import argparse
 import datetime
+import json
 import os
 import re
 import smtplib
@@ -28,7 +29,7 @@ from bs4 import BeautifulSoup
 
 MIN_RETURN = 0.30
 MIN_VOLUME = 500_000
-SPIKE_VOLUME = 20_000_000
+SPIKE_VOLUME = 15_000_000
 MIN_UP_DAY_RANGE = 0.05
 MAX_FLOAT = 30_000_000
 MAX_MARKET_CAP = 1_000_000_000
@@ -38,6 +39,10 @@ EMAIL_STAMP = KEY_FILE.parent / "last-email-date"
 EMAIL_PASSWORD_WARNING = KEY_FILE.parent / "last-password-warning"
 EMAIL_LOG = KEY_FILE.parent / "email.log"
 EASTERN = ZoneInfo("America/New_York")
+EXTENDED_START_MINUTE = 4 * 60
+EXTENDED_END_MINUTE = 20 * 60
+EXTENDED_HL_CACHE = Path(__file__).resolve().parent / "extended-hl-cache.json"
+RANGE_WORKERS = 8
 SEND_AFTER = (16, 16)
 GIVE_UP = (18, 0)
 GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{day}"
@@ -241,13 +246,74 @@ def parse_bars(rows: list[dict]) -> dict[str, tuple[float, float, float, float]]
     return bars
 
 
+def bar_time(stamp: float) -> datetime.datetime:
+    if stamp > 1e17:
+        stamp /= 1e9
+    elif stamp > 1e14:
+        stamp /= 1e6
+    elif stamp > 1e11:
+        stamp /= 1e3
+    return datetime.datetime.fromtimestamp(stamp, EASTERN)
+
+
+def live_session(api_key: str, day: date) -> dict[str, tuple[float, float, float, float]]:
+    """Price and accumulated volume for names that have traded today.
+
+    The grouped daily bar is empty before the regular session. The snapshot
+    still has the 4:00 a.m. Eastern trade, so the screen can use that session.
+    """
+    url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    bars: dict[str, tuple[float, float, float, float]] = {}
+    params: dict | None = {"apiKey": api_key}
+    while url:
+        response = requests.get(url, params=params, timeout=90)
+        if response.status_code == 429:
+            time.sleep(12)
+            continue
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if response.status_code != 200:
+            message = str(body.get("message") or body.get("error") or response.status_code)
+            raise RuntimeError(f"Polygon snapshot: {message}")
+        for row in body.get("tickers") or []:
+            symbol = normalize_symbol(str(row.get("ticker") or ""))
+            minute = row.get("min") or {}
+            price = minute.get("c")
+            stamp = minute.get("t")
+            if not symbol or not price or stamp is None:
+                continue
+            when = bar_time(float(stamp))
+            if when.date() != day:
+                continue
+            high = float(minute.get("h") or price)
+            low = float(minute.get("l") or price)
+            volume = float(minute.get("av") or 0)
+            bars[symbol] = (float(price), volume, high, low)
+        url = body.get("next_url")
+        params = None
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return bars
+
+
 def load_sessions(
     api_key: str, as_of: date
 ) -> list[tuple[date, dict[str, tuple[float, float, float, float]]]]:
     sessions: list[tuple[date, dict[str, tuple[float, float, float, float]]]] = []
+    today = datetime.datetime.now(EASTERN).date()
     for day in recent_weekdays(10, as_of):
         rows = fetch_grouped(api_key, day)
         if not rows:
+            if day == as_of == today:
+                bars = live_session(api_key, day)
+                if bars:
+                    sessions.append((day, bars))
+                    log(f"{day.isoformat()}: {len(bars)} symbols from the live session")
+                    if len(sessions) == 4:
+                        break
+                    continue
             log(f"{day.isoformat()}: no bars")
             continue
         bars = parse_bars(rows)
@@ -287,11 +353,217 @@ def traded_a_real_range(high: float, low: float) -> bool:
     return (high - low) / low >= MIN_UP_DAY_RANGE
 
 
+def load_hl_cache() -> dict:
+    try:
+        data = json.loads(EXTENDED_HL_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_hl_cache(cache: dict) -> None:
+    temporary = EXTENDED_HL_CACHE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(cache), encoding="utf-8")
+    os.replace(temporary, EXTENDED_HL_CACHE)
+
+
+def minute_high_low(api_key: str, symbol: str, start: date, end: date) -> dict[date, tuple[float, float]]:
+    """4:00 a.m. to 8:00 p.m. Eastern high and low, one pair per session date."""
+    origin = datetime.datetime(start.year, start.month, start.day, 4, 0, tzinfo=EASTERN)
+    finish = datetime.datetime(end.year, end.month, end.day, 20, 0, tzinfo=EASTERN)
+    spans: dict[date, list[float]] = {}
+    url = (
+        "https://api.polygon.io/v2/aggs/ticker/"
+        f"{symbol}/range/1/minute/{int(origin.timestamp() * 1000)}/{int(finish.timestamp() * 1000)}"
+    )
+    params: dict | None = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key}
+    while url:
+        body = None
+        for attempt in range(5):
+            response = requests.get(url, params=params, timeout=90)
+            if response.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if response.status_code == 404:
+                return {}
+            if response.status_code != 200:
+                message = str(body.get("message") or body.get("error") or response.status_code)
+                raise RuntimeError(f"{symbol}: {message}")
+            break
+        else:
+            raise RuntimeError(f"{symbol}: rate limit while fetching extended hours")
+        for row in (body or {}).get("results") or []:
+            stamp, high, low = row.get("t"), row.get("h"), row.get("l")
+            if None in (stamp, high, low):
+                continue
+            when = datetime.datetime.fromtimestamp(stamp / 1000, EASTERN)
+            minute = when.hour * 60 + when.minute
+            if when.weekday() >= 5 or not (EXTENDED_START_MINUTE <= minute < EXTENDED_END_MINUTE):
+                continue
+            key = when.date()
+            high_value = float(high)
+            low_value = float(low)
+            prior = spans.get(key)
+            if prior is None:
+                spans[key] = [high_value, low_value]
+            else:
+                prior[0] = max(prior[0], high_value)
+                prior[1] = min(prior[1], low_value)
+        url = (body or {}).get("next_url")
+        params = None
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return {day: (pair[0], pair[1]) for day, pair in spans.items()}
+
+
+def extended_ranges_for(
+    api_key: str,
+    symbols: list[str],
+    days: list[date],
+) -> dict[str, dict[date, tuple[float, float]]]:
+    """4:00 a.m. to 8:00 p.m. Eastern high and low. Completed sessions are cached."""
+    now = datetime.datetime.now(EASTERN)
+    live_day = now.date() if now.hour * 60 + now.minute < EXTENDED_END_MINUTE else None
+    cache = load_hl_cache()
+    result: dict[str, dict[date, tuple[float, float]]] = {symbol: {} for symbol in symbols}
+    fetch_symbols: list[str] = []
+    for symbol in symbols:
+        entry = cache.get(symbol)
+        if not isinstance(entry, dict):
+            entry = {}
+        complete = True
+        for day in days:
+            if day == live_day:
+                complete = False
+                continue
+            raw = entry.get(day.isoformat())
+            if isinstance(raw, list) and len(raw) == 2:
+                result[symbol][day] = (float(raw[0]), float(raw[1]))
+            else:
+                complete = False
+        if not complete:
+            fetch_symbols.append(symbol)
+    if not fetch_symbols:
+        return result
+
+    start, end = min(days), max(days)
+
+    def fetch_one(symbol: str) -> tuple[str, dict[date, tuple[float, float]]]:
+        return symbol, minute_high_low(api_key, symbol, start, end)
+
+    dirty = False
+    with ThreadPoolExecutor(max_workers=RANGE_WORKERS) as pool:
+        futures = [pool.submit(fetch_one, symbol) for symbol in fetch_symbols]
+        for future in as_completed(futures):
+            try:
+                symbol, spans = future.result()
+            except Exception as error:
+                log(str(error))
+                continue
+            result[symbol].update({day: pair for day, pair in spans.items() if day in days})
+            entry = cache.get(symbol)
+            if not isinstance(entry, dict):
+                entry = {}
+            for day, pair in spans.items():
+                if day == live_day:
+                    continue
+                entry[day.isoformat()] = [pair[0], pair[1]]
+                dirty = True
+            cutoff = (start - timedelta(days=21)).isoformat()
+            cache[symbol] = {day: pair for day, pair in entry.items() if day >= cutoff}
+    if dirty:
+        save_hl_cache(cache)
+    return result
+
+
+def was_inside_before_break(
+    api_key: str,
+    symbol: str,
+    day: date,
+    prior_high: float,
+    prior_low: float,
+    two_day_close: float | None,
+    three_day_close: float | None,
+) -> bool:
+    """True when the name qualified as an inside day, then traded above that prior high.
+
+    The inside-day screen allows the high up to 2% above the prior day. This is the
+    path before that ceiling broke: 500,000 shares and a 30% move while still inside.
+    """
+    ceiling = prior_high * 1.02
+    floor = prior_low * 0.98
+    origin = datetime.datetime(day.year, day.month, day.day, 4, 0, tzinfo=EASTERN)
+    finish = datetime.datetime(day.year, day.month, day.day, 20, 0, tzinfo=EASTERN)
+    url = (
+        "https://api.polygon.io/v2/aggs/ticker/"
+        f"{symbol}/range/1/minute/{int(origin.timestamp() * 1000)}/{int(finish.timestamp() * 1000)}"
+    )
+    params: dict | None = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key}
+    qualified = False
+    run_high = None
+    run_low = None
+    cumulative = 0.0
+    while url:
+        body = None
+        for attempt in range(5):
+            response = requests.get(url, params=params, timeout=90)
+            if response.status_code == 429:
+                time.sleep(10 * (attempt + 1))
+                continue
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if response.status_code == 404:
+                return False
+            if response.status_code != 200:
+                message = str(body.get("message") or body.get("error") or response.status_code)
+                raise RuntimeError(f"{symbol}: {message}")
+            break
+        else:
+            raise RuntimeError(f"{symbol}: rate limit while checking the inside-day path")
+        for row in (body or {}).get("results") or []:
+            stamp, high, low, close, volume = row.get("t"), row.get("h"), row.get("l"), row.get("c"), row.get("v")
+            if None in (stamp, high, low, close, volume):
+                continue
+            when = datetime.datetime.fromtimestamp(stamp / 1000, EASTERN)
+            minute = when.hour * 60 + when.minute
+            if when.date() != day or when.weekday() >= 5 or not (EXTENDED_START_MINUTE <= minute < EXTENDED_END_MINUTE):
+                continue
+            high_value = float(high)
+            low_value = float(low)
+            run_high = high_value if run_high is None else max(run_high, high_value)
+            run_low = low_value if run_low is None else min(run_low, low_value)
+            cumulative += float(volume)
+            price = float(close)
+            move = False
+            if two_day_close:
+                move = (price - two_day_close) / two_day_close >= MIN_RETURN
+            if three_day_close and not move:
+                move = (price - three_day_close) / three_day_close >= MIN_RETURN
+            inside = run_high <= ceiling and run_low >= floor
+            if inside and cumulative >= MIN_VOLUME and move:
+                qualified = True
+            if run_high > ceiling:
+                return qualified
+        url = (body or {}).get("next_url")
+        params = None
+        if url and "apiKey=" not in url:
+            url = f"{url}&apiKey={api_key}"
+    return False
+
+
 def find_matches(
     universe: set[str],
     sessions: list[tuple[date, dict[str, tuple[float, float, float, float]]]],
-    next_session: tuple[date, dict[str, tuple[float, float, float, float]]] | None = None,
-) -> list[dict]:
+    next_session: tuple[date, dict[str, tuple[float, float, float, float]]] | None,
+    api_key: str,
+    include_continuations: bool = False,
+):
     if len(sessions) < 4:
         raise RuntimeError("Need four trading sessions to measure a two-day or three-day move")
     latest_day, latest = sessions[0]
@@ -302,11 +574,11 @@ def find_matches(
         f"Comparing {two_day_base_day.isoformat()} or {three_day_base_day.isoformat()} "
         f"close to {latest_day.isoformat()}"
     )
-    matches: list[dict] = []
-    for symbol, (price, volume, high, low) in latest.items():
+    pending: list[dict] = []
+    for symbol, (price, volume, _high, _low) in latest.items():
         if symbol not in universe or symbol not in previous or price <= 0:
             continue
-        previous_close, previous_volume, previous_high, previous_low = previous[symbol]
+        previous_close, previous_volume, _previous_high, _previous_low = previous[symbol]
         if previous_close <= 0 or volume < MIN_VOLUME:
             continue
         two_day_change = None
@@ -319,42 +591,116 @@ def find_matches(
             three_day_change = (price - three_day_close) / three_day_close * 100
         two_day_hit = two_day_change is not None and two_day_change >= MIN_RETURN * 100
         three_day_hit = three_day_change is not None and three_day_change >= MIN_RETURN * 100
-        prior_day_volume = two_day_base.get(symbol, (None, 0))[1] or 0
-        if two_day_hit and max(volume, previous_volume) < SPIKE_VOLUME:
+        if previous_volume < SPIKE_VOLUME:
             two_day_hit = False
-        if three_day_hit and max(volume, previous_volume, prior_day_volume) < SPIKE_VOLUME:
             three_day_hit = False
         if not two_day_hit and not three_day_hit:
             continue
-        day_change = (price - previous_close) / previous_close * 100
+        pending.append(
+            {
+                "symbol": symbol,
+                "price": price,
+                "volume": volume,
+                "day_change": (price - previous_close) / previous_close * 100,
+                "three_day_change": three_day_change,
+                "two_day_hit": two_day_hit,
+                "three_day_hit": three_day_hit,
+                "two_day_close": two_day_close,
+                "three_day_close": three_day_close,
+            }
+        )
+    if not pending:
+        return ([], []) if include_continuations else []
+
+    range_days = [previous_day, latest_day]
+    next_day = next_session[0] if next_session is not None else None
+    if next_day is not None:
+        range_days.append(next_day)
+    log(
+        f"Reading 4:00 a.m. to 8:00 p.m. highs and lows for {len(pending)} names "
+        f"on {previous_day.isoformat()} and {latest_day.isoformat()}"
+    )
+    ranges = extended_ranges_for(api_key, [row["symbol"] for row in pending], range_days)
+    matches: list[dict] = []
+    breakouts: list[dict] = []
+    missing = 0
+    for row in pending:
+        span = ranges.get(row["symbol"]) or {}
+        today_span = span.get(latest_day)
+        prior_span = span.get(previous_day)
+        if today_span is None or prior_span is None:
+            missing += 1
+            continue
+        high, low = today_span
+        previous_high, previous_low = prior_span
+        if not traded_a_real_range(previous_high, previous_low):
+            continue
         inside_day = high <= previous_high * 1.02 and low >= previous_low * 0.98
-        if not inside_day or not traded_a_real_range(previous_high, previous_low):
+        broke_prior_high = high > previous_high * 1.02
+        if not inside_day and not (include_continuations and broke_prior_high):
             continue
         next_day_change = None
         next_day_max = None
+        price = row["price"]
         if next_session is not None and price > 0:
-            next_bar = next_session[1].get(symbol)
+            next_bar = next_session[1].get(row["symbol"])
             if next_bar is not None:
-                next_close, _, next_high, _ = next_bar
+                next_close, _, daily_high, _ = next_bar
+                next_high = span[next_day][0] if next_day is not None and next_day in span else daily_high
                 if next_close is not None:
                     next_day_change = (next_close - price) / price * 100
                 if next_high is not None:
                     next_day_max = (next_high - price) / price * 100
-        matches.append(
-            {
-                "date": latest_day.isoformat(),
-                "symbol": symbol,
-                "price": price,
-                "volume": volume,
-                "day_change": day_change,
-                "three_day_change": three_day_change,
-                "next_day_change": next_day_change,
-                "next_day_max": next_day_max,
-                "two_day_hit": two_day_hit,
-                "three_day_hit": three_day_hit,
-                "prior_high": previous_high,
+        built = {
+            "date": latest_day.isoformat(),
+            "symbol": row["symbol"],
+            "price": price,
+            "volume": row["volume"],
+            "day_change": row["day_change"],
+            "three_day_change": row["three_day_change"],
+            "next_day_change": next_day_change,
+            "next_day_max": next_day_max,
+            "two_day_hit": row["two_day_hit"],
+            "three_day_hit": row["three_day_hit"],
+            "prior_high": previous_high,
+            "prior_low": previous_low,
+            "two_day_close": row.get("two_day_close"),
+            "three_day_close": row.get("three_day_close"),
+        }
+        if inside_day:
+            matches.append(built)
+        else:
+            breakouts.append(built)
+    if missing:
+        log(f"{missing} names had no 4:00 a.m. to 8:00 p.m. high and low")
+    continuations: list[dict] = []
+    if breakouts:
+        log(f"Checking {len(breakouts)} names that traded above the prior day high")
+        with ThreadPoolExecutor(max_workers=RANGE_WORKERS) as pool:
+            checks = {
+                pool.submit(
+                    was_inside_before_break,
+                    api_key,
+                    row["symbol"],
+                    latest_day,
+                    row["prior_high"],
+                    row["prior_low"],
+                    row.get("two_day_close"),
+                    row.get("three_day_close"),
+                ): row
+                for row in breakouts
             }
-        )
+            for future in as_completed(checks):
+                row = checks[future]
+                try:
+                    qualified = future.result()
+                except Exception as error:
+                    log(f"{row['symbol']}: {error}")
+                    continue
+                if qualified:
+                    continuations.append(row)
+    if include_continuations:
+        return matches, continuations
     return matches
 
 
@@ -599,6 +945,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Scan for a 30% gain over two or three days, 500k screen-day volume, and a top-5 volume day. "
+            "The inside day uses the 4:00 a.m. to 8:00 p.m. Eastern high and low. "
             "The prior day's high must be at least 5% above its low."
         )
     )
@@ -630,7 +977,7 @@ def run_screen(as_of: date) -> int:
         log(f"Added {added} symbols listed on {screen_day.isoformat()} that are not in the current file")
     log(f"Universe has {len(universe)} symbols")
     next_session = load_next_session(api_key, sessions[0][0])
-    matches = find_matches(universe, sessions, next_session)
+    matches = find_matches(universe, sessions, next_session, api_key)
     columns = table_columns(next_session is not None)
     if not matches:
         print("No stocks matched.")
